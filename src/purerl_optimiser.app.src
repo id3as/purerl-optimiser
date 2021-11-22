@@ -1,0 +1,14 @@
+{application, purerl_optimiser,
+ [{description, "A parse-transform to perform optimisations on purescript/purerl generated code"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.
