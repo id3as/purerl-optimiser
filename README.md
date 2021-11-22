@@ -1,10 +1,16 @@
 # purerl-optimiser
 
-A parse-transform for optimising the output from purescript / purerl. There are a number of
+A parse-transform for optimising the output from purescript / purerl. There are a number of optimisations performed, the most significant of which pertains to memoization of terms to prevent repeated evaluation of constant values. The identification of such terms is performed by purerl itself, which wraps such terms in a `MEMOIZE` macro, e.g.
+
+```
+?MEMOIZE(some_constant_evaluation())
+```
+
+When PURERL_MEMOIZE is defined (see below), this macro expands to a named identity function, `memoize`, which is then detected by the parse transform and translated into storage and retrieval using the erlang persistent_term subsystem (https://www.erlang.org/doc/man/persistent_term.html) as the underlying store.
 
 # Configuration
 
-At present, configuration is simple and purely around the optimisations around math operators. For example, in your rebar.config,
+Within your rebar.config, you will want configuration similiar to the following:
 
 ```
 {deps, [
@@ -15,8 +21,8 @@ At present, configuration is simple and purely around the optimisations around m
 
 {erl_opts,
  [ ...
- , {parse_transform, purerl_optimiser}
  , {d, 'PURERL_MEMOIZE', 1}
+ , {parse_transform, purerl_optimiser}
  , {purerl_optimiser, #{ math => #{ booleanLike => [ "Data.HeytingAlgebra.heytingAlgebraBoolean "
                                                    ]
                                   , intLike => [ "Data.Eq.eqInt"
@@ -45,9 +51,9 @@ At present, configuration is simple and purely around the optimisations around m
 
 So within deps, include this repository. And then within your erl_opts:
 
-`{parse_transform, purerl_optimiser}` - add the parse transform to the compile step
-
 `{d, 'PURERL_MEMOIZE', 1}` - define PURERL_MEMOIZE to enable the memoization feature
+
+`{parse_transform, purerl_optimiser}` - add the parse transform to the compile step
 
 `{purerl_optimiser, ...` - configuration for the parse transform itself. Currently, this provides information for the math optimisations to indicate which types (or more specifically typeclasses) are just Newtype wrappers around boolean / integer / float values.
 
