@@ -1,6 +1,7 @@
 -module(purerl_optimiser).
 
 -export([ parse_transform/2
+        , purs_type_to_erl/1
         ]).
 
 -define(match_function(Name, Arity, Clauses), {function, _, Name, Arity, Clauses}).
@@ -22,7 +23,9 @@
 -define(make_case(Value, Clauses), {'case', 0, Value, Clauses}).
 -define(make_tuple(Items), {tuple, 0, Items}).
 
-parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module} | _], _Options) ->
+parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module} | _], CompileOptions) ->
+
+  TransformOptions = proplists:get_value(purerl_optimiser, CompileOptions, #{}),
 
   case is_purs(Module) of
     true ->
@@ -32,10 +35,8 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
                           Forms,
                           [ fun optimise_discard/1
                           , fun optimise_newtype/1
-                          , fun optimise_math/1
+                          , fun(F) -> optimise_math(F, TransformOptions) end
                           , fun unroll/1
-                          , fun add_reflect_symbol_as_atom/1
-                          , fun optimise_reflect_symbol/1
                           , fun magic_do/1
                           , fun(F) -> memoise_terms(F, Module) end
                           ]
@@ -65,93 +66,23 @@ parse_transform(Forms, _Options) ->
   Forms.
 
 %%------------------------------------------------------------------------------
-%%-- Math - spot the common math operators on Int and Number and replace
-optimise_math(Forms) ->
-  MathTerms = walk(Forms, fun gather_math_terms/2, #{}),
-  {NewForms, _} = modify(Forms, fun preIdentity/2, fun optimise_math_form/2, MathTerms),
+%%-- Discard - replace control_bind.discard(discardUnit) with just a bind
+optimise_discard(Forms) ->
+  {NewForms, _} = modify(Forms, fun optimise_discard_form/2, fun postIdentity/2, undefined),
   NewForms.
 
-gather_math_terms({function, _, Name, 0, [?match_clause([], [], [ ?match_call(?local_call(memoize),
-                                                                              [ ?match_call(?remote_call(MathModule, Operator),
-                                                                                            [?match_call(?remote_call(TypeClassModule, TypeClass), [])])
-                                                                              ]
-                                                                             )
-                                                                ])
-                                         ]}, Acc)
-  when (((MathModule == 'data_ord@ps') andalso ((Operator == lessThan) orelse (Operator == lessThanOrEq) orelse (Operator == greaterThan) orelse (Operator == greaterThanOrEq) orelse (Operator == min) orelse (Operator == max)))
-        orelse
-        ((MathModule == 'data_semiring@ps') andalso ((Operator == add) orelse (Operator == mul)))
-        orelse
-        ((MathModule == 'data_ring@ps') andalso ((Operator == sub)))
-        orelse
-        ((MathModule == 'data_euclideanRing@ps') andalso ((Operator == 'div')))
-        orelse
-        ((MathModule == 'data_eq@ps') andalso ((Operator == 'eq')))
-        orelse
-        ((MathModule == 'data_heytingAlgebra@ps') andalso ((Operator == 'conj') orelse (Operator == 'disj')))
-       )
-       andalso
-       (((TypeClassModule == 'data_ord@ps') andalso ((TypeClass == ordInt) orelse (TypeClass == ordNumber)))
-        orelse
-        ((TypeClassModule == 'data_semiring@ps') andalso ((TypeClass == semiringInt) orelse (TypeClass == semiringNumber)))
-        orelse
-        ((TypeClassModule == 'data_ring@ps') andalso ((TypeClass == ringInt) orelse (TypeClass == ringNumber)))
-        orelse
-        ((TypeClassModule == 'data_euclideanRing@ps') andalso ((TypeClass == euclideanRingInt) orelse (TypeClass == euclideanRingNumber)))
-        orelse
-        ((TypeClassModule == 'data_eq@ps') andalso ((TypeClass == eqInt) orelse (TypeClass == eqNumber)))
-        orelse
-        ((TypeClassModule == 'data_heytingAlgebra@ps') andalso ((TypeClass == heytingAlgebraBoolean)))
-        orelse
-        ((TypeClassModule == 'data_time_duration@ps') andalso ((TypeClass == ordMilliseconds)))
-        orelse
-        ((TypeClassModule == 'avp_types@ps') andalso ((TypeClass == semiringFfiInt90) orelse (TypeClass == ringFfiInt90) orelse (TypeClass == ordFfiInt90)))
-        ) ->
-  maps:put(Name, {Operator, TypeClass}, Acc);
+optimise_discard_form(_Form = ?match_call(?local_call('memoize'),
+                                          [?match_call(?remote_call('control_bind@ps', discard), [?match_call(?remote_call('control_bind@ps', discardUnit), []),
+                                                                                                  BindDict
+                                                                                                 ]
+                                                      )
+                                          ]),
+                     State) ->
+  NewForm = ?make_call(?make_local_call(memoize), [?make_call(?make_remote_call('control_bind@ps', 'bind'), [BindDict])]),
+  {replace, NewForm, State};
 
-gather_math_terms(_Form, Acc) ->
-  Acc.
-
-optimise_math_form(Form = ?match_call(
-                             ?match_call(
-                                ?match_call(?local_call(MaybeMathFun), []),
-                                [Arg1]
-                               ),
-                             [Arg2]), State) ->
-  case maps:find(MaybeMathFun, State) of
-    error ->
-      {Form, State};
-    {ok, {Operator, TypeClass}} ->
-      {CallOrOp, NewOperator} = case Operator of
-                                  lessThan -> {op, '<'};
-                                  lessThanOrEq -> {op, '=<'};
-                                  greaterThan -> {op, '>'};
-                                  greaterThanOrEq -> {op, '>='};
-                                  min -> ?make_call(?make_remote_call(erlang, min), [Arg1, Arg2]);
-                                  max -> ?make_call(?make_remote_call(erlang, max), [Arg1, Arg2]);
-                                  add -> {op, '+'};
-                                  mul -> {op, '*'};
-                                  sub -> {op, '-'};
-                                  eq -> {op, '=='};
-                                  conj -> {op, 'andalso'};
-                                  disj -> {op, 'orelse'};
-                                  'div' ->
-                                    case TypeClass of
-                                      euclideanRingInt -> {op, 'div'};
-                                      euclideanRingNumber -> {op, '/'}
-                                    end
-                                end,
-
-      NewForm = case CallOrOp of
-                  op -> {op, 0, NewOperator, Arg1, Arg2};
-                  call -> NewOperator
-                end,
-
-      {NewForm, State}
-  end;
-
-optimise_math_form(Form, State) ->
-  {Form, State}.
+optimise_discard_form(_Form, State) ->
+  {undefined, State}.
 
 %%------------------------------------------------------------------------------
 %%-- Remove newtype over / lens over
@@ -281,24 +212,102 @@ optimise_newtype_form(Form = ?match_call(
 optimise_newtype_form(Form, State) ->
   {Form, State}.
 
+
 %%------------------------------------------------------------------------------
-%%-- Discard - replace control_bind.discard(discardUnit) with just a bind
-optimise_discard(Forms) ->
-  {NewForms, _} = modify(Forms, fun optimise_discard_form/2, fun postIdentity/2, undefined),
+%%-- Math - spot the common math operators on Int and Number and replace
+optimise_math(Forms, Options) ->
+
+  #{ booleanLike := B
+   , intLike := I
+   , numberLike := N} = maps:get(math, Options, #{ booleanLike => []
+                                                 , intLike => []
+                                                 , numberLike => []
+                                                 }),
+
+  MathTypes = lists:foldl(fun({TypeName, Type}, Acc) ->
+                              {TypeClassModule, TypeClass} = purs_type_to_erl(TypeName),
+                              maps:put({TypeClassModule, TypeClass}, Type, Acc)
+                          end,
+                          #{},
+                          lists:append( [ [{Item, boolean} || Item <- B]
+                                        , [{Item, int} || Item <- I]
+                                        , [{Item, number} || Item <- N]])),
+
+  MathTerms = walk(Forms, fun(Form, Acc) -> gather_math_terms(Form, Acc, MathTypes) end, #{}),
+
+  {NewForms, _} = modify(Forms, fun preIdentity/2, fun optimise_math_form/2, MathTerms),
   NewForms.
 
-optimise_discard_form(_Form = ?match_call(?local_call('memoize'),
-                                          [?match_call(?remote_call('control_bind@ps', discard), [?match_call(?remote_call('control_bind@ps', discardUnit), []),
-                                                                                                  BindDict
-                                                                                                 ]
-                                                      )
-                                          ]),
-                     State) ->
-  NewForm = ?make_call(?make_local_call(memoize), [?make_call(?make_remote_call('control_bind@ps', 'bind'), [BindDict])]),
-  {replace, NewForm, State};
+gather_math_terms({function, _, Name, 0, [?match_clause([], [], [ ?match_call(?local_call(memoize),
+                                                                              [ ?match_call(?remote_call(MathModule, Operator),
+                                                                                            [?match_call(?remote_call(TypeClassModule, TypeClass), [])])
+                                                                              ]
+                                                                             )
+                                                                ])
+                                         ]}, Acc, MathTypes)
+  when (((MathModule == 'data_ord@ps') andalso ((Operator == lessThan) orelse (Operator == lessThanOrEq) orelse (Operator == greaterThan) orelse (Operator == greaterThanOrEq) orelse (Operator == min) orelse (Operator == max)))
+        orelse
+        ((MathModule == 'data_semiring@ps') andalso ((Operator == add) orelse (Operator == mul)))
+        orelse
+        ((MathModule == 'data_ring@ps') andalso ((Operator == sub)))
+        orelse
+        ((MathModule == 'data_euclideanRing@ps') andalso ((Operator == 'div')))
+        orelse
+        ((MathModule == 'data_eq@ps') andalso ((Operator == 'eq')))
+        orelse
+        ((MathModule == 'data_heytingAlgebra@ps') andalso ((Operator == 'conj') orelse (Operator == 'disj')))
+       ) ->
 
-optimise_discard_form(_Form, State) ->
-  {undefined, State}.
+  case maps:find({TypeClassModule, TypeClass}, MathTypes) of
+    {ok, Type} ->
+      maps:put(Name, {Operator, Type}, Acc);
+    error ->
+      Acc
+  end;
+
+gather_math_terms(_Form, Acc, _MathOptions) ->
+  Acc.
+
+optimise_math_form(Form = ?match_call(
+                             ?match_call(
+                                ?match_call(?local_call(MaybeMathFun), []),
+                                [Arg1]
+                               ),
+                             [Arg2]), State) ->
+  case maps:find(MaybeMathFun, State) of
+    error ->
+      {Form, State};
+    {ok, {Operator, Type}} ->
+      {CallOrOp, NewOperator} = case Operator of
+                                  lessThan -> {op, '<'};
+                                  lessThanOrEq -> {op, '=<'};
+                                  greaterThan -> {op, '>'};
+                                  greaterThanOrEq -> {op, '>='};
+                                  min -> ?make_call(?make_remote_call(erlang, min), [Arg1, Arg2]);
+                                  max -> ?make_call(?make_remote_call(erlang, max), [Arg1, Arg2]);
+                                  add -> {op, '+'};
+                                  mul -> {op, '*'};
+                                  sub -> {op, '-'};
+                                  eq -> {op, '=='};
+                                  conj -> {op, 'andalso'};
+                                  disj -> {op, 'orelse'};
+                                  'div' ->
+                                    case Type of
+                                      int -> {op, 'div'};
+                                      number -> {op, '/'}
+                                    end
+                                end,
+
+      NewForm = case CallOrOp of
+                  op -> {op, 0, NewOperator, Arg1, Arg2};
+                  call -> NewOperator
+                end,
+
+      {NewForm, State}
+  end;
+
+optimise_math_form(Form, State) ->
+  {Form, State}.
 
 %%------------------------------------------------------------------------------
 %%-- Unroll
@@ -320,14 +329,6 @@ unroll_form(_Form = ?match_call(
             State) when AllOrAny == all orelse AllOrAny == any->
 
   {?make_call(?make_remote_call(lists, AllOrAny), [Fn, List]), State};
-
-unroll_form(_Form = ?match_call(?remote_call('common_utils@ps', 'unsafeFromJust'),
-                                 [Message, Value]),
-             N) ->
-  Var = list_to_atom("__@M" ++ integer_to_list(N)),
-  {{'case', 0, Value, [ {clause, 0, [{tuple, 0, [{atom, 0, nothing}]}], [], [{call, 0, {remote, 0, {atom, 0, 'partial_unsafe@ps'}, {atom, 0, unsafeCrashWith}}, [Message]}]}
-                      , {clause, 0, [{tuple, 0, [{atom, 0, just}, {var, 0, Var}]}], [], [{var, 0, Var}]}
-                      ]}, N + 1};
 
 unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', insert), [Key, Value, Map]), N) ->
   {{map, 0, Map, [{map_field_assoc, 0, Key, Value}]}, N};
@@ -362,39 +363,6 @@ unroll_form(_Form = ?match_call(?remote_call('control_monad_reader_trans@ps', 'r
                                 [Fn, Context]
                                ), State) ->
   {?make_call(Fn, [Context]), State};
-
-unroll_form(_Form = ?match_call(?remote_call('workflow_nodeM@ps', 'runNodeM'),
-                                [Context, Fn]
-                               ), State) ->
-  {?make_call(Fn, [Context]), State};
-
-%% Not currently in use, since the mapping fun itself is not currently inlined
-%% unroll_form(_Form = ?match_call(
-%%                        ?match_call(
-%%                           ?match_call(
-%%                              ?local_call(memoize),
-%%                              [?match_call(
-%%                                  ?remote_call('data_functor@ps', map),
-%%                                  [?match_map([
-%%                                               ?map_field(?match_atom(map),
-%%                                                          {'fun', _, {clauses, [{clause, _, [?match_var(F)], [],
-%%                                                                                 [{'fun', _, {clauses, [{clause, _, [?match_var(V)], [],
-%%                                                                                                         [{'case', _, {tuple, _, [?match_var(F), ?match_var(V)]}, Body}
-%%                                                                                                         ]
-%%                                                                                                         }]}}
-%%                                                                                 ]
-%%                                                                                }
-%%                                                                               ]}}
-%%                                                         )
-%%                                              ])]
-%%                                 )
-%%                              ]
-%%                             ),
-%%                           [Fn]
-%%                          ),
-%%                        [Value]
-%%                       ), N) ->
-%%   {{'case', 0, {tuple, 0, [Fn, Value]}, Body}, N};
 
 unroll_form(Form, State) ->
   {Form, State}.
@@ -435,99 +403,6 @@ magic_do_form(_Form = ?match_call(
 
 magic_do_form(Form, State) ->
   {Form, State}.
-
-%%------------------------------------------------------------------------------
-%%-- add_reflect_symbol_as_atom - looks for the creation of the IsSymbol typeclass,
-%%-- and adds a reflectSymbolAsAtom function
-add_reflect_symbol_as_atom(Forms) ->
-  {NewForms, _} = modify(Forms, fun find_reflect_symbol/2, fun postIdentity/2, undefined),
-  NewForms.
-
-find_reflect_symbol(?match_map([
-                                ReflectSymbolString = ?map_field(?match_atom(reflectSymbol),
-                                                                 { 'fun'
-                                                                 , _
-                                                                 , { clauses
-                                                                   , [?match_clause(
-                                                                        [?match_var('_')]
-                                                                      , []
-                                                                      , [{bin, _, [{ bin_element
-                                                                                   , _
-                                                                                   , {string, _, _}
-                                                                                   , default
-                                                                                   , [utf8]
-                                                                                   }
-                                                                                  ]}]
-                                                                      )
-                                                                     ]
-                                                                   }
-                                                                 }
-                                                                )
-                               ]),
-                    State) ->
-
-  {ReflectSymbolAtom, _} = modify(ReflectSymbolString, fun make_reflect_symbol_atom/2, fun postIdentity/2, {}),
-
-  Form2 = {'map', 0, [ReflectSymbolString,
-                      ReflectSymbolAtom]},
-
-  {replace, Form2, State};
-
-find_reflect_symbol(_, State) ->
-  {undefined, State}.
-
-make_reflect_symbol_atom(?match_atom(reflectSymbol), State) ->
-  {replace, ?make_atom(reflectSymbolAtom), State};
-
-make_reflect_symbol_atom({bin, _, [{ bin_element
-                                   , _
-                                   , {string, _, Str}
-                                   , default
-                                   , [utf8]
-                                   }
-                                  ]}, State) ->
-  {replace, ?make_atom(list_to_atom(Str)), State};
-
-make_reflect_symbol_atom(_, State) ->
-  {undefined, State}.
-
-%%------------------------------------------------------------------------------
-%%-- optimise_reflect_symbol - looks for calls to reflectSymbolAsAtom and replaces
-%%-- with a call to the a reflectSymbolAsAtom function
-optimise_reflect_symbol(Forms) ->
-  {NewForms, _} = modify(Forms, fun optimise_reflect_symbol_form/2, fun postIdentity/2, undefined),
-  NewForms.
-
-optimise_reflect_symbol_form(?match_call(
-                                ?match_call(?remote_call('common_utils@ps', reflectSymbolAsAtom),
-                                            [IsSymbolDict]),
-                                [Sym]),
-                             State) ->
-
-  NewForm = ?make_call(
-             ?make_call(?make_remote_call(maps, get), [?make_atom(reflectSymbolAtom), IsSymbolDict]),
-             [Sym]
-            ),
-
-  {replace, NewForm, State};
-
-optimise_reflect_symbol_form(?match_call(?remote_call('erl_atom@ps', atom),
-                                         [ ?match_call(
-                                              ?match_call(?remote_call('data_symbol@ps', reflectSymbol), [IsSymbolDict]),
-                                              [Sym]
-                                             )
-                                         ]
-                                        ),
-                             State) ->
-  NewForm = ?make_call(
-             ?make_call(?make_remote_call(maps, get), [?make_atom(reflectSymbolAtom), IsSymbolDict]),
-             [Sym]
-            ),
-
-  {replace, NewForm, State};
-
-optimise_reflect_symbol_form(_, State) ->
-  {undefined, State}.
 
 %%------------------------------------------------------------------------------
 %%-- Memoisation - find instances of the memoize function and replace with lookups via persistent_term
@@ -615,7 +490,7 @@ find_memoisable_terms(?match_call(?local_call('memoize'), [Call = ?match_call(Fn
                            Prefix = case Fn of
                                       ?match_call(?remote_call(_Module, FnName), _) -> atom_to_list(FnName);
                                       ?match_call(?local_call(FnName), _) -> atom_to_list(FnName);
-                                      ?remote_call(Module, FnName) -> atom_to_list(FnName);
+                                      ?remote_call(_Module, FnName) -> atom_to_list(FnName);
                                       ?match_atom(FnName) -> atom_to_list(FnName);
                                       _ -> "unknown"
                                     end,
@@ -695,6 +570,16 @@ is_purs(Module) ->
     [$s, $p, $@ | _] -> true;
     _ -> false
   end.
+
+purs_type_to_erl(Type) ->
+  Parts = string:split(Type, ".", all),
+  purs_type_to_erl_(Parts, []).
+
+purs_type_to_erl_([[H | Head], Type], Acc) ->
+  {list_to_atom(lists:append(lists:reverse(["@ps", [string:to_lower(H) | Head] | Acc]))), list_to_atom(Type)};
+
+purs_type_to_erl_([[H | Head] | Tail], Acc) ->
+  purs_type_to_erl_(Tail, ["_", [string:to_lower(H) | Head] | Acc]).
 
 preIdentity(_, State) -> {undefined, State}.
 postIdentity(X, State) -> {X, State}.

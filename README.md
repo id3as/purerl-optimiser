@@ -1,9 +1,7 @@
-purerl-optimiser
-=====
+# purerl-optimiser
 
-An OTP library
+A parse-transform for optimising the output from purescript / purerl
 
-Build
------
+## Build
 
     $ rebar3 compile
