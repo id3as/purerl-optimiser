@@ -35,6 +35,7 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
                           Forms,
                           [ fun optimise_discard/1
                           , fun optimise_newtype/1
+                          , fun optimise_process_raw/1
                           , fun(F) -> optimise_math(F, TransformOptions) end
                           , fun unroll/1
                           , fun magic_do/1
@@ -211,6 +212,23 @@ optimise_newtype_form(Form = ?match_call(
 
 optimise_newtype_form(Form, State) ->
   {Form, State}.
+
+%%------------------------------------------------------------------------------
+%%-- Replace erl_process_raw@ps:send with ! and erl_process_raw@ps:self with self
+optimise_process_raw(Forms) ->
+  {NewForms, _} = modify(Forms, fun optimise_process_raw_forms/2, fun postIdentity/2, undefined),
+  NewForms.
+
+optimise_process_raw_forms(_Form = ?match_call(?match_call(?remote_call('erl_process_raw@ps', send), Args), []), State) ->
+  NewForm = ?make_call(?make_remote_call('erlang', 'send'), Args),
+  {replace, NewForm, State};
+
+optimise_process_raw_forms(_Form = ?match_call(?match_call(?remote_call('erl_process_raw@ps', self), []), []), State) ->
+  NewForm = ?make_call(?make_remote_call('erlang', 'self'), []),
+  {replace, NewForm, State};
+
+optimise_process_raw_forms(_Form, State) ->
+  {undefined, State}.
 
 
 %%------------------------------------------------------------------------------
@@ -605,6 +623,10 @@ walk(Form = {'case', _Line, Of, Clauses}, Fun, State) ->
 walk(Form = {'block', _Line, Statements}, Fun, State) ->
   State2 = Fun(Form, State),
   walk(Statements, Fun, State2);
+
+walk(Form = {'receive', _Line, Clauses}, Fun, State) ->
+  State2 = Fun(Form, State),
+  walk(Clauses, Fun, State2);
 
 walk(Form = {'match', _Line, Var, Statement}, Fun, State) ->
   State2 = Fun(Form, State),
