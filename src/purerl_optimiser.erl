@@ -5,11 +5,15 @@
         ]).
 
 -define(match_function(Name, Arity, Clauses), {function, _, Name, Arity, Clauses}).
+-define(match_local_fun(Name, Arity), {'fun', _, {function, Name, Arity}}).
+-define(match_remote_fun(Module, Name, Arity), {'fun', _, {function, Module, Name, Arity}}).
 -define(match_clause(Args, Guards, Body), {clause, _, Args, Guards, Body}).
 -define(match_call(Fun, Args), {call, _, Fun, Args}).
 -define(local_call(Fun), {atom, _, Fun}).
 -define(remote_call(Mod, Fun), {remote, _, {atom, _, Mod}, {atom, _, Fun}}).
+-define(match_match(Lhs, Rhs), {match, _, Lhs, Rhs}).
 -define(match_atom(Atom), {atom, _, Atom}).
+-define(match_integer(Int), {integer, _, Int}).
 -define(match_var(Name), {var, _, Name}).
 -define(match_map(Fields), {map, _, Fields}).
 -define(map_field(Name, Value), {map_field_assoc, _, Name, Value}).
@@ -35,10 +39,10 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
                           Forms,
                           [ fun optimise_discard/1
                           , fun optimise_newtype/1
-                          , fun optimise_process_raw/1
+                           , fun optimise_unsafeCoerce/1
                           , fun(F) -> optimise_math(F, TransformOptions) end
                           , fun unroll/1
-                          , fun magic_do/1
+                          , fun effectfull_funs/1
                           , fun(F) -> memoise_terms(F, Module) end
                           ]
                          ),
@@ -214,22 +218,67 @@ optimise_newtype_form(Form, State) ->
   {Form, State}.
 
 %%------------------------------------------------------------------------------
-%%-- Replace erl_process_raw@ps:send with ! and erl_process_raw@ps:self with self
-optimise_process_raw(Forms) ->
-  {NewForms, _} = modify(Forms, fun optimise_process_raw_forms/2, fun postIdentity/2, undefined),
+%%-- Remove unsafeCoerce
+optimise_unsafeCoerce(Forms) ->
+  {NewForms, _} = modify(Forms, fun optimise_unsafeCoerce_forms/2, fun postIdentity/2, undefined),
   NewForms.
 
-optimise_process_raw_forms(_Form = ?match_call(?match_call(?remote_call('erl_process_raw@ps', send), Args), []), State) ->
-  NewForm = ?make_call(?make_remote_call('erlang', 'send'), Args),
+%% think this one is already done by purerl
+optimise_unsafeCoerce_forms(_Form = ?match_call(?remote_call('unsafe_coerce@ps', unsafeCoerce), [Arg]), State) ->
+  NewForm = Arg,
   {replace, NewForm, State};
 
-optimise_process_raw_forms(_Form = ?match_call(?match_call(?remote_call('erl_process_raw@ps', self), []), []), State) ->
-  NewForm = ?make_call(?make_remote_call('erlang', 'self'), []),
+%% but this isn't
+optimise_unsafeCoerce_forms(FunForm = ?match_function(_Name, _Arity, Clauses), State) ->
+
+  UnsafeCoerceFns = walk(Clauses, fun(Form, Acc) -> gather_unsafecoerce_funs(Form, Acc) end, #{}),
+
+  {NewForm, _} = modify(FunForm, fun optimise_unsafeCoerce_funs/2, fun postIdentity/2, UnsafeCoerceFns),
+
   {replace, NewForm, State};
 
-optimise_process_raw_forms(_Form, State) ->
+optimise_unsafeCoerce_forms(_Form, State) ->
   {undefined, State}.
 
+optimise_unsafeCoerce_funs(?match_clause(Args, Guards, Body), State) ->
+  {NewBody1, _} = modify(Body, fun optimise_unsafeCoerce_remove_calls/2, fun postIdentity/2, State),
+
+  NewBody2 = NewBody1,
+    %% Not currently dropping, since we don't look for places where the coerce fn is created but then passed to something else, e.g.
+    %% myfun() ->
+    %%   MyCoerce = fun unsafe_coerce@ps:unsafeCoerce/1,
+    %%   someCall(MyCoerce).
+    %%
+    %% lists:filter(fun(?match_match(?match_var(_Name),
+    %%                               ?match_remote_fun(?match_atom(unsafe_coerce@ps), ?match_atom(unsafeCoerce), ?match_integer(1)))) ->
+    %%                  false;
+    %%                 (_) ->
+    %%                  true
+    %%              end,
+    %%              NewBody1),
+
+  {replace, ?make_clause(Args, Guards, NewBody2), State};
+
+optimise_unsafeCoerce_funs(_Form, State) ->
+  {undefined, State}.
+
+optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?match_var(Var), [Arg]), State) ->
+  case maps:is_key(Var, State) of
+    true ->
+      {replace, Arg, State};
+    false ->
+      {undefined, State}
+  end;
+
+optimise_unsafeCoerce_remove_calls(_Form, State) ->
+  {undefined, State}.
+
+gather_unsafecoerce_funs(?match_match(?match_var(Name),
+                                      ?match_remote_fun(?match_atom(unsafe_coerce@ps), ?match_atom(unsafeCoerce), ?match_integer(1))), Acc) ->
+  maps:put(Name, undefined, Acc);
+
+gather_unsafecoerce_funs(_Form, Acc) ->
+  Acc.
 
 %%------------------------------------------------------------------------------
 %%-- Math - spot the common math operators on Int and Number and replace
@@ -387,39 +436,31 @@ unroll_form(Form, State) ->
 
 %%------------------------------------------------------------------------------
 %%-- Look for specific applications of effectful funs and rewrite then
-magic_do(Forms) ->
-  {NewForms, _} = modify(Forms, fun preIdentity/2, fun magic_do_form/2, undefined),
+effectfull_funs(Forms) ->
+  {NewForms, _} = modify(Forms, fun preIdentity/2, fun effectfull_funs_form/2, undefined),
   NewForms.
 
-magic_do_form(_Form = ?match_call(
-                         ?match_call(?remote_call('erl_process@ps', send), [To, Msg]),
-                         []
-                        ),
-              State) ->
+effectfull_funs_form(_Form = ?match_call(?match_call(?remote_call('erl_process_raw@ps', send), Args), []), State) ->
+  NewForm = ?make_call(?make_remote_call('erlang', 'send'), Args),
+  {NewForm, State};
+
+effectfull_funs_form(_Form = ?match_call(?match_call(?remote_call('erl_process_raw@ps', self), []), []), State) ->
+  NewForm = ?make_call(?make_remote_call('erlang', 'self'), []),
+  {NewForm, State};
+
+effectfull_funs_form(_Form = ?match_call(?match_call(?remote_call('erl_process@ps', send), [To, Msg]), []), State) ->
   Replace = {op, 0, '!', To, Msg},
-
   {Replace, State};
 
-magic_do_form(_Form = ?match_call(
-                         ?match_call(?remote_call('erl_kernel_erlang@ps', monotonicTime), []),
-                         []
-                        ),
-              State) ->
+effectfull_funs_form(_Form = ?match_call(?match_call(?remote_call('erl_kernel_erlang@ps', monotonicTime), []), []), State) ->
   Replace = ?make_call(?make_remote_call(erlang, monotonic_time), []),
-
   {Replace, State};
 
-magic_do_form(_Form = ?match_call(
-                         ?match_call(?remote_call('erl_kernel_file@ps', read), [Handle, Amount]),
-                         []
-                        ),
-              State) ->
-
+effectfull_funs_form(_Form = ?match_call(?match_call(?remote_call('erl_kernel_file@ps', read), [Handle, Amount]), []), State) ->
   Replace = ?make_call(?make_remote_call('erl_kernel_file@foreign', unsafeRead), [Handle, Amount]),
-
   {Replace, State};
 
-magic_do_form(Form, State) ->
+effectfull_funs_form(Form, State) ->
   {Form, State}.
 
 %%------------------------------------------------------------------------------
