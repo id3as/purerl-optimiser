@@ -350,8 +350,8 @@ optimise_math_form(Form = ?match_call(
                                   lessThanOrEq -> {op, '=<'};
                                   greaterThan -> {op, '>'};
                                   greaterThanOrEq -> {op, '>='};
-                                  min -> ?make_call(?make_remote_call(erlang, min), [Arg1, Arg2]);
-                                  max -> ?make_call(?make_remote_call(erlang, max), [Arg1, Arg2]);
+                                  min -> {call, ?make_call(?make_remote_call(erlang, min), [Arg1, Arg2])};
+                                  max -> {call, ?make_call(?make_remote_call(erlang, max), [Arg1, Arg2])};
                                   add -> {op, '+'};
                                   mul -> {op, '*'};
                                   sub -> {op, '-'};
