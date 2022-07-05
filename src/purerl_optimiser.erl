@@ -488,7 +488,7 @@ find_memoisable_terms(Form = {attribute, _, module, _Module}, State) ->
   Export = {attribute, 0, export, [{setupPersistentTerm, 0}]},
   OnLoad = {attribute, 0, on_load, {setupPersistentTerm, 0}},
 
-  {replace, [Form, Export, OnLoad], State};
+  {replace, [Form, OnLoad, Export], State};
 
 find_memoisable_terms(Form = {eof, _}, State = #memoise_state{map = TermMap}) ->
 
@@ -507,7 +507,9 @@ find_memoisable_terms(Form = {eof, _}, State = #memoise_state{map = TermMap}) ->
                                [ ?make_tuple([?make_var('_'), ?make_var('_'), ?make_var('_')]) ],
                                [ ],
                                [ {match, 0, ?make_var('X'), Body}
-                               , ?make_call(?make_remote_call(persistent_term, put), [Key, {var, 0, 'X'}])
+                               , {match, 0, ?make_var('Y'), ?make_call(?make_remote_call(persistent_term, put), [Key, {var, 0, 'X'}])}
+                               %% , {match, 0, ?make_var('Y'), ?make_call(?make_remote_call(timer, tc), [?make_atom(persistent_term), ?make_atom(put), {cons, 0, Key, {cons, 0, {var, 0, 'X'}, {nil, 0}}}])}
+                               %% , ?make_call(?make_remote_call(logger, notice), [{string, 0, "XXX HERE ~p/~p: ~p~n"}, {cons, 0, {atom, 0, Name}, {cons, 0, {integer, 0, length(Args)}, {cons, 0, ?make_var('Y'), {nil, 0}}}}])
                                , ?make_var('X')
                                ]
                               )
@@ -521,7 +523,7 @@ find_memoisable_terms(Form = {eof, _}, State = #memoise_state{map = TermMap}) ->
                    end,
                    maps:values(TermMap)),
 
-  SetupCalls = lists:filtermap(fun({_, Name, [], _Body}) ->
+  SetupCalls = lists:filtermap(fun({Name, [], _Body}) ->
                                    {true, ?make_call(?make_atom(Name), [])};
                                   (_) ->
                                    false
