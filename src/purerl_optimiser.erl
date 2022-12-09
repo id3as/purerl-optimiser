@@ -1,3 +1,8 @@
+%%-------------
+%% Can run outside of build tools with a command line such as:
+%%
+%% erlc -pa ../purerl-optimiser/_build/default/lib/purerl_optimiser/ebin -DPURERL_MEMOIZE=1 +'{parse_transform, purerl_optimiser}' +'{purerl_optimiser, #{math => #{booleanLike => [], intLike => ["Data.EuclideanRing.euclideanRingInt"], numberLike => ["Data.EuclideanRing.euclideanRingNumber"]}}}' server/output/Foo.Bar/foo_bar@ps.erl
+%%-------------
 -module(purerl_optimiser).
 
 -export([ parse_transform/2
@@ -54,7 +59,8 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
         _ ->
           filelib:ensure_dir("/tmp/purs_optimiser/foo.txt"),
           _ = file:delete("/tmp/purs_optimiser/" ++ atom_to_list(Module) ++ ".erl"),
-          file:write_file("/tmp/purs_optimiser/" ++ atom_to_list(Module) ++ ".forms", io_lib:format("~p~n.", [Final])),
+          file:write_file("/tmp/purs_optimiser/" ++ atom_to_list(Module) ++ ".forms-in", io_lib:format("~p~n.", [Forms])),
+          file:write_file("/tmp/purs_optimiser/" ++ atom_to_list(Module) ++ ".forms-out", io_lib:format("~p~n.", [Final])),
           lists:foreach(fun(Form) ->
                             ok = file:write_file("/tmp/purs_optimiser/" ++ atom_to_list(Module) ++ ".erl", erl_pp:form(Form, [{indent, 2}, {linewidth, 120}]), [append]),
                             ok
@@ -320,11 +326,12 @@ gather_math_terms({function, _, Name, 0, [?match_clause([], [], [ ?match_call(?l
         orelse
         ((MathModule == 'data_euclideanRing@ps') andalso ((Operator == 'div')))
         orelse
+        ((MathModule == 'data_euclideanRing@ps') andalso ((Operator == 'mod')))
+        orelse
         ((MathModule == 'data_eq@ps') andalso ((Operator == 'eq')))
         orelse
         ((MathModule == 'data_heytingAlgebra@ps') andalso ((Operator == 'conj') orelse (Operator == 'disj')))
        ) ->
-
   case maps:find({TypeClassModule, TypeClass}, MathTypes) of
     {ok, Type} ->
       maps:put(Name, {Operator, Type}, Acc);
@@ -341,35 +348,42 @@ optimise_math_form(Form = ?match_call(
                                 [Arg1]
                                ),
                              [Arg2]), State) ->
+
   case maps:find(MaybeMathFun, State) of
     error ->
       {Form, State};
     {ok, {Operator, Type}} ->
-      {CallOrOp, NewOperator} = case Operator of
-                                  lessThan -> {op, '<'};
-                                  lessThanOrEq -> {op, '=<'};
-                                  greaterThan -> {op, '>'};
-                                  greaterThanOrEq -> {op, '>='};
-                                  min -> {call, ?make_call(?make_remote_call(erlang, min), [Arg1, Arg2])};
-                                  max -> {call, ?make_call(?make_remote_call(erlang, max), [Arg1, Arg2])};
-                                  add -> {op, '+'};
-                                  mul -> {op, '*'};
-                                  sub -> {op, '-'};
-                                  eq -> {op, '=='};
-                                  conj -> {op, 'andalso'};
-                                  disj -> {op, 'orelse'};
-                                  'div' ->
-                                    case Type of
-                                      int -> {op, 'div'};
-                                      number -> {op, '/'}
-                                    end
-                                end,
 
-      NewForm = case CallOrOp of
-                  op -> {op, 0, NewOperator, Arg1, Arg2};
-                  call -> NewOperator
+      Change = case Operator of
+                 lessThan -> {op, '<'};
+                 lessThanOrEq -> {op, '=<'};
+                 greaterThan -> {op, '>'};
+                 greaterThanOrEq -> {op, '>='};
+                 min -> {call, ?make_call(?make_remote_call(erlang, min), [Arg1, Arg2])};
+                 max -> {call, ?make_call(?make_remote_call(erlang, max), [Arg1, Arg2])};
+                 add -> {op, '+'};
+                 mul -> {op, '*'};
+                 sub -> {op, '-'};
+                 eq -> {op, '=='};
+                 conj -> {op, 'andalso'};
+                 disj -> {op, 'orelse'};
+                 'div' ->
+                   case Type of
+                     int -> {op, 'div'};
+                     number -> {op, '/'}
+                   end;
+                 'mod' ->
+                   case Type of
+                     int -> {call, ?make_call(?make_remote_call('data_euclideanRing@foreign', intMod), [Arg1, Arg2])};
+                     number -> {literal, {float, 0, 0.0}}
+                   end
+               end,
+
+      NewForm = case Change of
+                  {op, NewOperator} -> {op, 0, NewOperator, Arg1, Arg2};
+                  {call, Fn} -> Fn;
+                  {literal, Literal} -> Literal
                 end,
-
       {NewForm, State}
   end;
 
