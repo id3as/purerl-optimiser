@@ -13,14 +13,18 @@
 -define(match_local_fun(Name, Arity), {'fun', _, {function, Name, Arity}}).
 -define(match_remote_fun(Module, Name, Arity), {'fun', _, {function, Module, Name, Arity}}).
 -define(match_clause(Args, Guards, Body), {clause, _, Args, Guards, Body}).
+-define(match_block(Body), {block, _, Body}).
+-define(match_case(Value, Clauses), {'case', _, Value, Clauses}).
 -define(match_call(Fun, Args), {call, _, Fun, Args}).
 -define(local_call(Fun), {atom, _, Fun}).
 -define(remote_call(Mod, Fun), {remote, _, {atom, _, Mod}, {atom, _, Fun}}).
 -define(match_match(Lhs, Rhs), {match, _, Lhs, Rhs}).
+-define(match_tuple(Entries), {tuple, _, Entries}).
 -define(match_atom(Atom), {atom, _, Atom}).
 -define(match_integer(Int), {integer, _, Int}).
 -define(match_var(Name), {var, _, Name}).
 -define(match_map(Fields), {map, _, Fields}).
+-define(map_field_exact(Name, Value), {map_field_exact, _, Name, Value}).
 -define(map_field(Name, Value), {map_field_assoc, _, Name, Value}).
 
 -define(make_call(Fun, Args), {call, 0, Fun, Args}).
@@ -29,8 +33,11 @@
 -define(make_atom(Name), {atom, 0, Name}).
 -define(make_var(Name), {var, 0, Name}).
 -define(make_clause(Args, Guards, Body), {clause, 0, Args, Guards, Body}).
+-define(make_block(Body), {block, 0, Body}).
 -define(make_case(Value, Clauses), {'case', 0, Value, Clauses}).
 -define(make_tuple(Items), {tuple, 0, Items}).
+-define(make_nil, {nil, 0}).
+-define(make_cons(H, T), {cons, 0, H, T}).
 
 parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module} | _], CompileOptions) ->
 
@@ -44,8 +51,10 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
                           Forms,
                           [ fun optimise_discard/1
                           , fun optimise_newtype/1
-                           , fun optimise_unsafeCoerce/1
+                          , fun optimise_unsafeCoerce/1
                           , fun(F) -> optimise_math(F, TransformOptions) end
+                          , fun inline/1
+                          , fun unmemoise/1
                           , fun unroll/1
                           , fun effectfull_funs/1
                           , fun(F) -> memoise_terms(F, Module) end
@@ -54,7 +63,7 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
 
       %% Debug output...
       case os:getenv("PURS_OPTIMISER_DEBUG") of
-        false ->
+        xfalse ->
           ok;
         _ ->
           filelib:ensure_dir("/tmp/purs_optimiser/foo.txt"),
@@ -391,42 +400,170 @@ optimise_math_form(Form, State) ->
   {Form, State}.
 
 %%------------------------------------------------------------------------------
+%%-- Unmemoise - a precurse to unroll, unmemoising things that we want to unroll below...
+unmemoise(Forms) ->
+  {_, UnmemoiseMap} = modify(Forms, fun unmemoise_form/2, fun postIdentity/2, #{}),
+
+  {Forms, UnmemoiseMap}.
+
+unmemoise_form(?match_function(Name, 0, [?match_clause([], [],
+                                                       [?match_call(
+                                                           ?local_call(memoize),
+                                                           [?match_call(?remote_call('data_foldable@ps', AllOrAny),
+                                                                        [?match_call(?remote_call('erl_data_list_types@ps', 'foldableList'), []),
+                                                                         ?match_call(?remote_call('data_heytingAlgebra@ps', 'heytingAlgebraBoolean'), [])
+                                                                        ]
+                                                                       )
+                                                           ]
+                                                          )
+                                                       ]
+                                                       )
+                                        ]), State) when AllOrAny == all orelse AllOrAny == any ->
+
+  Replacement = ?make_remote_call(lists, AllOrAny),
+
+  {undefined, maps:put(Name, Replacement, State)};
+
+unmemoise_form(_Form, State) ->
+  {undefined, State}.
+
+%%------------------------------------------------------------------------------
+%%-- Inline - we are looking for things like
+%%-- X = erl_data_map@ps:lookup(A, B),
+%%-- case X of
+%%--   bla
+%%-- where X is not used in any other places in the function
+%%-- When we fine it, we inline it to `case erl_data_map...`, at which point
+%%-- unroll may well turn it into a direct call to map:find
+inline(Forms) ->
+  {NewForms, _} = modify(Forms, fun preIdentity/2, fun inline_form/2, 0),
+  NewForms.
+
+inline_form(_Form = ?match_clause(Args, Guards, Body), State) ->
+  Body2 = inline_uncons(Body),
+  {?make_clause(Args, Guards, Body2), State};
+
+inline_form(_Form = ?match_block(Body), State) ->
+  Body2 = inline_uncons(Body),
+  {?make_block(Body2), State};
+
+inline_form(Form, State) ->
+  {Form, State}.
+
+inline_uncons([Match = ?match_match(?match_var(Res), Call = ?match_call(?remote_call('erl_data_list_types@ps', uncons), [_List]))
+               | T]) ->
+
+  case walk(T, fun(Form, Acc) -> inline_count_var(Res, Form, Acc) end, 0) of
+    1 ->
+      %% We can do it
+      {Inlined, _} = modify(T, fun preIdentity/2, fun inline_uncons_inline_case/2, {Call, Res}),
+      inline_uncons(Inlined);
+    _N ->
+      %% Nope, variable is reused
+      [Match | inline_uncons(T)]
+  end;
+
+inline_uncons([H | T]) ->
+  [H | inline_uncons(T)];
+
+inline_uncons([]) ->
+  [].
+
+inline_count_var(Var, ?match_var(Var), N) ->
+  N + 1;
+inline_count_var(_, _, N) ->
+  N.
+
+inline_uncons_inline_case(_Form = ?match_var(Var), State = {Call, Var}) ->
+  {Call, State};
+inline_uncons_inline_case(Form, State) ->
+  {Form, State}.
+
+%%------------------------------------------------------------------------------
 %%-- Unroll
-unroll(Forms) ->
-  {NewForms, _} = modify(Forms, fun preIdentity/2, fun unroll_form/2, 0),
+-record(unroll_state,
+       { unmemoise_map
+       , n
+       }).
+
+unroll({Forms, UnmemoiseMap}) ->
+  {NewForms, _} = modify(Forms, fun unroll_form/2, fun postIdentity/2, #unroll_state{unmemoise_map = UnmemoiseMap, n = 0}),
   NewForms.
 
 unroll_form(_Form = ?match_call(
                        ?match_call(
-                          ?match_call(?local_call(memoize),
-                                     [ ?match_call(?remote_call('data_foldable@ps', AllOrAny),
-                                                   [?match_call(?remote_call('erl_data_list_types@ps', 'foldableList'), []),
-                                                    ?match_call(?remote_call('data_heytingAlgebra@ps', 'heytingAlgebraBoolean'), [])
-                                                   ]
-                                                  )
-                                     ]),
-                          [Fn]),
-                       [List]),
-            State) when AllOrAny == all orelse AllOrAny == any->
+                          ?match_call(?local_call(Name), []),
+                          [Arg1]),
+                       [Arg2]),
+            State) ->
 
-  {?make_call(?make_remote_call(lists, AllOrAny), [Fn, List]), State};
+  case maps:find(Name, State#unroll_state.unmemoise_map) of
+    error ->
+      {undefined, State};
+    {ok, Replacement} ->
+      {replace, ?make_call(Replacement, [Arg1, Arg2]), State}
+  end;
 
-unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', insert), [Key, Value, Map]), N) ->
-  {{map, 0, Map, [{map_field_assoc, 0, Key, Value}]}, N};
+unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]),
+                                Clauses
+                               ), State) ->
+  try
+    Clauses2 = [?make_clause([unroll_uncons_clause(Match)], Guards, Body) || ?match_clause([Match], Guards, Body) <- Clauses],
+    Form = ?make_case(List, Clauses2),
+    {replace, Form, State}
+  catch _:_ ->
+      io:format(user, "FAILED TO DEAL WITH ~p~n", [Clauses]),
+      {undefined, State}
+  end;
+
+unroll_form(_Form = ?match_case(?match_tuple([]), _Clauses), State) ->
+  {undefined, State};
+
+unroll_form(_Form = ?match_case(?match_tuple(Elements), Clauses), State) ->
+  {Elements2, Clauses2} = unroll_tuple_clauses(Elements, Clauses),
+  {replace, ?make_case(?make_tuple(Elements2), Clauses2), State};
+
+unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', insert), [Key, Value, Map]), State) ->
+  {replace, {map, 0, Map, [{map_field_assoc, 0, Key, Value}]}, State};
+
+unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]),
+                                [ ?match_clause([?match_tuple([?match_atom("just"), ?match_var(Var)])], [], JustBody)
+                                , ?match_clause([?match_tuple([?match_atom("nothing")])], [], NothingBody)
+                                ]), State) ->
+  {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
+                       [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], JustBody)
+                       , ?make_clause([?make_atom(error)], [], NothingBody)
+                       ]), State};
+
+unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]),
+                                [ ?match_clause([?match_tuple([?match_atom(nothing)])], [], NothingBody)
+                                , ?match_clause([?match_tuple([?match_atom(just), ?match_var(Var)])], [], JustBody)
+                                ]), State) ->
+  {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
+                       [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], JustBody)
+                       , ?make_clause([?make_atom(error)], [], NothingBody)
+                       ]), State};
+
+unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]), State = #unroll_state{n = N}) ->
+  Var = list_to_atom("__@M" ++ integer_to_list(N)),
+  {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
+              [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], [?make_tuple([?make_atom(just), ?make_var(Var)])])
+              , ?make_clause([?make_atom(error)], [], [?make_tuple([?make_atom(nothing)])])
+              ]), State#unroll_state{n = N + 1}};
 
 unroll_form(_Form = ?match_call(?remote_call('data_maybe@ps', 'fromMaybe\''),
                                  [DefaultFn, Value]),
-             N) ->
+             State = #unroll_state{n = N}) ->
 
   Var = list_to_atom("__@M" ++ integer_to_list(N)),
-  {?make_case(Value, [ ?make_clause([?make_tuple([?make_atom(nothing)])], [], [?make_call(DefaultFn, [?make_atom(unit)])])
-                     , ?make_clause([?make_tuple([?make_atom(just), ?make_var(Var)])], [], [?make_var(Var)])
-                     ]), N + 1};
+  {replace, ?make_case(Value, [ ?make_clause([?make_tuple([?make_atom(nothing)])], [], [?make_call(DefaultFn, [?make_atom(unit)])])
+                              , ?make_clause([?make_tuple([?make_atom(just), ?make_var(Var)])], [], [?make_var(Var)])
+                              ]), State#unroll_state{n = N + 1}};
 
 unroll_form(_Form = ?match_call(
                         ?match_call(_Call = ?remote_call(Module, Fn), []),
                         [Arg1]),
-             N)
+             State = #unroll_state{n = N})
   when (Module == 'data_either@ps' andalso Fn == 'Left') orelse
        (Module == 'data_either@ps' andalso Fn == 'Right') ->
 
@@ -434,19 +571,134 @@ unroll_form(_Form = ?match_call(
                  'Left' -> left;
                  'Right' -> right
                end,
-  {?make_tuple([?make_atom(EitherType), Arg1]), N + 1};
+  {replace, ?make_tuple([?make_atom(EitherType), Arg1]), State#unroll_state{n = N + 1}};
 
 unroll_form(_Form = ?match_call(_Call = ?remote_call('foreign@ps', 'unsafeFromForeign'), [Arg]),
-             N) ->
-  {Arg, N};
+             State) ->
+  {replace, Arg, State};
 
 unroll_form(_Form = ?match_call(?remote_call('control_monad_reader_trans@ps', 'runReaderT'),
                                 [Fn, Context]
                                ), State) ->
-  {?make_call(Fn, [Context]), State};
+  {replace, ?make_call(Fn, [Context]), State};
 
-unroll_form(Form, State) ->
-  {Form, State}.
+unroll_form(_Form, State) ->
+  {undefined, State}.
+
+%% we have a list of the tuple elements in `case {a, b, c} of`, and a list of the clauses.  Each clause *must* also be a tuple of the same arity
+unroll_tuple_clauses(Elements, Clauses) ->
+  ElementsFromClauses = [ClauseElements || ?match_clause([?match_tuple(ClauseElements)], _, _) <- Clauses],
+  Paired = pair_elements(Elements, ElementsFromClauses),
+
+  UnrolledPaired = unroll_tuple_clauses_inner(Paired),
+%%io:format(user, "ELEMENTS ~p~nCLAUSES ~p~nELEMENTS FROM ~p~nPAIRED ~p~nUNROLLED ~p~n", [Elements, Clauses, ElementsFromClauses, Paired, UnrolledPaired]),
+  {Elements2, ElementsFromClauses2} = unpair_elements(UnrolledPaired),
+  {Elements2, lists:map(fun({ElementsFromClause, ?match_clause(_, Guards, Body)}) ->
+                            ?make_clause([?make_tuple(ElementsFromClause)], Guards, Body)
+                        end,
+                        lists:zip(ElementsFromClauses2, Clauses))}.
+
+unroll_tuple_clauses_inner([]) ->
+  [];
+unroll_tuple_clauses_inner([{H = ?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]), Clauses} | T]) ->
+  try
+    [{List, [unroll_uncons_clause(Clause) || Clause <- Clauses]} | unroll_tuple_clauses_inner(T)]
+  catch
+    _:_ ->
+      io:format(user, "FAILED TO DEAL WITH ~p~n", [Clauses]),
+      [H | unroll_tuple_clauses_inner(T)]
+  end;
+
+unroll_tuple_clauses_inner([H | T]) ->
+  [H | unroll_tuple_clauses_inner(T)].
+
+%% we have {[a, b], [[1, 4], [2, 5], [3, 6]]}
+%% we want [{a, [1, 2, 3]}, {b, [4, 5, 6]}]
+pair_elements([], _) ->
+  [];
+pair_elements([H | T], Clauses) ->
+  {FirstElementsFromClauses, Clauses2} = take_first(Clauses),
+  [{H, FirstElementsFromClauses} | pair_elements(T, Clauses2)].
+
+take_first(Clauses) ->
+  take_first(Clauses, {[], []}).
+
+take_first([], {FirstElements, Clauses}) ->
+  {lists:reverse(FirstElements), lists:reverse(Clauses)};
+
+take_first([[] | RemainingClauses], {ElementsAcc, ClausesAcc}) ->
+  take_first(RemainingClauses, {ElementsAcc, ClausesAcc});
+
+take_first([[First | RemainingElementsInThisClause] | RemainingClauses], {ElementsAcc, ClausesAcc}) ->
+  take_first(RemainingClauses, {[First | ElementsAcc], [RemainingElementsInThisClause | ClausesAcc]}).
+
+%% we have [{a, [1, 2, 3]}, {b, [4, 5, 6]}]
+%% we want {[a, b], [[1, 4], [2, 5], [3, 6]]}
+unpair_elements(Pairs) ->
+  %% this gets us {[a, b], [[1, 2, 3], [4, 5, 6]]}
+  {Elements, Clauses} = lists:unzip(Pairs),
+
+  {Elements, unpair_clauses(Clauses)}.
+
+unpair_clauses([]) ->
+  [];
+unpair_clauses(Clauses) ->
+  case take_first(Clauses) of
+    {[], Clauses2} ->
+      unpair_clauses(Clauses2);
+    {FirstElementsFromClauses, Clauses2} ->
+      [FirstElementsFromClauses | unpair_clauses(Clauses2)]
+  end.
+
+unroll_uncons_clause(?match_tuple([?match_atom(nothing)])) ->
+  ?make_nil;
+
+unroll_uncons_clause(?match_tuple([?match_atom(just),
+                                   ?match_map([ ?map_field_exact(?match_atom(head), H)
+                                              , ?map_field_exact(?match_atom(tail), T)
+                                              ])])) ->
+  ?make_cons(H, T);
+
+unroll_uncons_clause(?match_tuple([?match_atom(just),
+                                   ?match_map([ ?map_field_exact(?match_atom(head), H)
+                                              ])])) ->
+  ?make_cons(H, ?make_var('_'));
+
+unroll_uncons_clause(?match_tuple([?match_atom(just),
+                                   ?match_map([ ?map_field_exact(?match_atom(tail), T)
+                                              ])])) ->
+  ?make_cons(?make_var('_'), T);
+
+unroll_uncons_clause(?match_tuple([?match_atom(just), L])) ->
+  L;
+
+unroll_uncons_clause(CatchAll = ?match_var('_')) ->
+  CatchAll.
+
+%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(nothing)])], NothingGuards, NothingBody)) ->
+%%   ?make_clause([?make_nil], NothingGuards, NothingBody);
+
+%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just),
+%%                                                   ?match_map([ ?map_field_exact(?match_atom(head), H)
+%%                                                              , ?map_field_exact(?match_atom(tail), T)
+%%                                                              ])])], JustGuards, JustBody)) ->
+%%   ?make_clause([?make_cons(H, T)], JustGuards, JustBody);
+
+%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just),
+%%                                                   ?match_map([ ?map_field_exact(?match_atom(head), H)
+%%                                                              ])])], JustGuards, JustBody)) ->
+%%   ?make_clause([?make_cons(H, ?make_var('_'))], JustGuards, JustBody);
+
+%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just),
+%%                                                   ?match_map([ ?map_field_exact(?match_atom(tail), T)
+%%                                                              ])])], JustGuards, JustBody)) ->
+%%   ?make_clause([?make_cons(?make_var('_'), T)], JustGuards, JustBody);
+
+%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just), L])], JustGuards, JustBody)) ->
+%%   ?make_clause([L], JustGuards, JustBody);
+
+%% unroll_uncons_clause(CatchAll = ?match_clause([?match_var('_')], _, _)) ->
+%%   CatchAll.
 
 %%------------------------------------------------------------------------------
 %%-- Look for specific applications of effectful funs and rewrite then
