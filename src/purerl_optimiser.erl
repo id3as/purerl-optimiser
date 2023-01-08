@@ -7,6 +7,10 @@
 
 -export([ parse_transform/2
         , purs_type_to_erl/1
+        , walk/3
+        , modify/4
+        , preIdentity/2
+        , postIdentity/2
         ]).
 
 -define(match_function(Name, Arity, Clauses), {function, _, Name, Arity, Clauses}).
