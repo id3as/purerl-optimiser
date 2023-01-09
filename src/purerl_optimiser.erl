@@ -42,6 +42,8 @@
 -define(make_tuple(Items), {tuple, 0, Items}).
 -define(make_nil, {nil, 0}).
 -define(make_cons(H, T), {cons, 0, H, T}).
+-define(make_map(Fields), {map, 0, Fields}).
+-define(make_map_field(Name, Value), {map_field_assoc, 0, Name, Value}).
 
 parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module} | _], CompileOptions) ->
 
@@ -512,7 +514,7 @@ unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_list_types@ps
                                 Clauses
                                ), State) ->
   try
-    Clauses2 = [?make_clause([unroll_uncons_clause(Match)], Guards, Body) || ?match_clause([Match], Guards, Body) <- Clauses],
+    Clauses2 = [unroll_uncons_clause(Match, Guards, Body) || ?match_clause([Match], Guards, Body) <- Clauses],
     Form = ?make_case(List, Clauses2),
     {replace, Form, State}
   catch _:_ ->
@@ -595,7 +597,7 @@ unroll_tuple_clauses(Elements, Clauses) ->
   Paired = pair_elements(Elements, ElementsFromClauses),
 
   UnrolledPaired = unroll_tuple_clauses_inner(Paired),
-%%io:format(user, "ELEMENTS ~p~nCLAUSES ~p~nELEMENTS FROM ~p~nPAIRED ~p~nUNROLLED ~p~n", [Elements, Clauses, ElementsFromClauses, Paired, UnrolledPaired]),
+
   {Elements2, ElementsFromClauses2} = unpair_elements(UnrolledPaired),
   {Elements2, lists:map(fun({ElementsFromClause, ?match_clause(_, Guards, Body)}) ->
                             ?make_clause([?make_tuple(ElementsFromClause)], Guards, Body)
@@ -604,13 +606,17 @@ unroll_tuple_clauses(Elements, Clauses) ->
 
 unroll_tuple_clauses_inner([]) ->
   [];
-unroll_tuple_clauses_inner([{H = ?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]), Clauses} | T]) ->
+unroll_tuple_clauses_inner([{?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]), Clauses} | T]) ->
   try
-    [{List, [unroll_uncons_clause(Clause) || Clause <- Clauses]} | unroll_tuple_clauses_inner(T)]
+    [{List, [begin
+                 ?match_clause([Args], _Guards, _Body) = unroll_uncons_clause(Clause, undefined, undefined),
+                 Args
+             end
+             || Clause <- Clauses]} | unroll_tuple_clauses_inner(T)]
   catch
     _:_ ->
       io:format(user, "FAILED TO DEAL WITH ~p~n", [Clauses]),
-      [H | unroll_tuple_clauses_inner(T)]
+      [{List, Clauses} | unroll_tuple_clauses_inner(T)]
   end;
 
 unroll_tuple_clauses_inner([H | T]) ->
@@ -654,30 +660,36 @@ unpair_clauses(Clauses) ->
       [FirstElementsFromClauses | unpair_clauses(Clauses2)]
   end.
 
-unroll_uncons_clause(?match_tuple([?match_atom(nothing)])) ->
-  ?make_nil;
+unroll_uncons_clause(?match_tuple([?match_atom(nothing)]), Guards, Body) ->
+    ?make_clause([?make_nil], Guards, Body);
 
 unroll_uncons_clause(?match_tuple([?match_atom(just),
                                    ?match_map([ ?map_field_exact(?match_atom(head), H)
                                               , ?map_field_exact(?match_atom(tail), T)
-                                              ])])) ->
-  ?make_cons(H, T);
+                                              ])]),
+                     Guards, Body) ->
+  ?make_clause([?make_cons(H, T)], Guards, Body);
 
 unroll_uncons_clause(?match_tuple([?match_atom(just),
                                    ?match_map([ ?map_field_exact(?match_atom(head), H)
-                                              ])])) ->
-  ?make_cons(H, ?make_var('_'));
+                                              ])]),
+                     Guards, Body) ->
+  ?make_clause([?make_cons(H, ?make_var('_'))], Guards, Body);
+
 
 unroll_uncons_clause(?match_tuple([?match_atom(just),
                                    ?match_map([ ?map_field_exact(?match_atom(tail), T)
-                                              ])])) ->
-  ?make_cons(?make_var('_'), T);
+                                              ])]),
+                     Guards, Body) ->
+  ?make_clause([?make_cons(?make_var('_'), T)], Guards, Body);
 
-unroll_uncons_clause(?match_tuple([?match_atom(just), L])) ->
-  L;
+unroll_uncons_clause(?match_tuple([?match_atom(just), ?match_var(L)]), [], [?match_var(L)]) ->
+    H = list_to_atom("__H_" ++ atom_to_list(L)),
+    T = list_to_atom("__T_" ++ atom_to_list(L)),
+    ?make_clause([?make_cons(?make_var(H), ?make_var(T))], [], [?make_map([?make_map_field(?make_atom(head), ?make_var(H)), ?make_map_field(?make_atom(tail), ?make_var(T))])]);
 
-unroll_uncons_clause(CatchAll = ?match_var('_')) ->
-  CatchAll.
+unroll_uncons_clause(CatchAll = ?match_var('_'), Guards, Body) ->
+  ?make_clause([CatchAll], Guards, Body).
 
 %% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(nothing)])], NothingGuards, NothingBody)) ->
 %%   ?make_clause([?make_nil], NothingGuards, NothingBody);
