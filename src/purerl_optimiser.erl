@@ -34,6 +34,7 @@
 -define(make_call(Fun, Args), {call, 0, Fun, Args}).
 -define(make_local_call(Name), ?make_atom(Name)).
 -define(make_remote_call(Mod, Fun), {remote, 0, ?make_atom(Mod), ?make_atom(Fun)}).
+-define(make_lambda(Clauses), {'fun', 0, {clauses, Clauses}}).
 -define(make_atom(Name), {atom, 0, Name}).
 -define(make_var(Name), {var, 0, Name}).
 -define(make_clause(Args, Guards, Body), {clause, 0, Args, Guards, Body}).
@@ -44,6 +45,7 @@
 -define(make_cons(H, T), {cons, 0, H, T}).
 -define(make_map(Fields), {map, 0, Fields}).
 -define(make_map_field(Name, Value), {map_field_assoc, 0, Name, Value}).
+-define(make_match(Lhs, Rhs), {match, 0, Lhs, Rhs}).
 
 parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module} | _], CompileOptions) ->
 
@@ -136,7 +138,8 @@ gather_newtype_fns(?match_function(Name, 0, [?match_clause([], [], [?match_call(
                                                                                 ]
                                                                                )])]),
                    Acc = #{removeFromCompose := Remove}) ->
-  Acc#{removeFromCompose => [Name | Remove]};
+  Acc#{removeFromCompose => [Name | Remove]
+      , unwrap => Name};
 
 gather_newtype_fns(?match_function(Name, 0, [?match_clause([], [], [?match_call(?local_call(memoize),
                                                                                 [ ?match_call(?remote_call('data_newtype@ps', 'wrap'),
@@ -183,6 +186,29 @@ optimise_newtype_form(_Form =
                                 ),
                    State = #{lensNewtype := Name}) ->
   {?make_call(Arg1, [Arg2]), State};
+
+%% %% Optimise `Data.Lens.Setter.Over _ unwrap` - e.g over MyNewtype unwrap x -> x
+%% optimise_newtype_form(_Form =
+%%                      ?match_call(?remote_call('data_lens_setter@ps', 'over'),
+%%                                  [ ?match_call(?local_call(_), [])
+%%                                  , ?match_call(?local_call(Name), [])
+%%                                  , Arg2
+%%                                  ]
+%%                                 ),
+%%                    State = #{unwrap := Name}) ->
+%%   {Arg2, State};
+
+%% %% As above, but when curried - e.g, map (over MyNewtype unwrap) l -> map identity l - we strip out `map identity` elsewhere...
+%% optimise_newtype_form(_Form =
+%%                         ?match_call(
+%%                            ?match_call(
+%%                               ?match_call(?remote_call('data_lens_setter@ps', 'over'), []),
+%%                               [?match_call(?local_call(_), [])]
+%%                              ),
+%%                            [?match_call(?local_call(Name), [])]
+%%                           ),
+%%                    State = #{unwrap := Name}) ->
+%%   {?make_lambda([?make_clause([?make_var('X')], [], [?make_var('X')])]), State};
 
 %% Optimise composition with wrap / unwrap / _Newtype
 optimise_newtype_form(Form = ?match_call(
@@ -241,50 +267,47 @@ optimise_newtype_form(Form, State) ->
 %%------------------------------------------------------------------------------
 %%-- Remove unsafeCoerce
 optimise_unsafeCoerce(Forms) ->
-  {NewForms, _} = modify(Forms, fun optimise_unsafeCoerce_forms/2, fun postIdentity/2, undefined),
+  GlobalBindings = walk(Forms, fun(Form, Acc) -> gather_global_unsafecoerce_bindings(Form, Acc) end, #{}),
+  {NewForms, _} = modify(Forms, fun optimise_unsafeCoerce_forms/2, fun postIdentity/2, GlobalBindings),
   NewForms.
 
-%% think this one is already done by purerl
+%% think this one is already done by purerl - unsafeCoerce x
 optimise_unsafeCoerce_forms(_Form = ?match_call(?remote_call('unsafe_coerce@ps', unsafeCoerce), [Arg]), State) ->
   NewForm = Arg,
   {replace, NewForm, State};
 
-%% but this isn't
-optimise_unsafeCoerce_forms(FunForm = ?match_function(_Name, _Arity, Clauses), State) ->
+%% but this isn't -
+%% let foo = unsafeCoerce
+%% foo x
+optimise_unsafeCoerce_forms(FunForm = ?match_function(_Name, _Arity, Clauses), GlobalBindings) ->
 
-  UnsafeCoerceFns = walk(Clauses, fun(Form, Acc) -> gather_unsafecoerce_funs(Form, Acc) end, #{}),
+  LocalBindings = walk(Clauses, fun(Form, Acc) -> gather_local_unsafecoerce_bindings(Form, Acc) end, #{}),
 
-  {NewForm, _} = modify(FunForm, fun optimise_unsafeCoerce_funs/2, fun postIdentity/2, UnsafeCoerceFns),
+  {NewForm, _} = modify(FunForm, fun optimise_unsafeCoerce_funs/2, fun postIdentity/2, {GlobalBindings, LocalBindings}),
 
-  {replace, NewForm, State};
+  {replace, NewForm, GlobalBindings};
 
 optimise_unsafeCoerce_forms(_Form, State) ->
   {undefined, State}.
 
 optimise_unsafeCoerce_funs(?match_clause(Args, Guards, Body), State) ->
-  {NewBody1, _} = modify(Body, fun optimise_unsafeCoerce_remove_calls/2, fun postIdentity/2, State),
+  {NewBody, _} = modify(Body, fun optimise_unsafeCoerce_remove_calls/2, fun postIdentity/2, State),
 
-  NewBody2 = NewBody1,
-    %% Not currently dropping, since we don't look for places where the coerce fn is created but then passed to something else, e.g.
-    %% myfun() ->
-    %%   MyCoerce = fun unsafe_coerce@ps:unsafeCoerce/1,
-    %%   someCall(MyCoerce).
-    %%
-    %% lists:filter(fun(?match_match(?match_var(_Name),
-    %%                               ?match_remote_fun(?match_atom(unsafe_coerce@ps), ?match_atom(unsafeCoerce), ?match_integer(1)))) ->
-    %%                  false;
-    %%                 (_) ->
-    %%                  true
-    %%              end,
-    %%              NewBody1),
-
-  {replace, ?make_clause(Args, Guards, NewBody2), State};
+  {replace, ?make_clause(Args, Guards, NewBody), State};
 
 optimise_unsafeCoerce_funs(_Form, State) ->
   {undefined, State}.
 
-optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?match_var(Var), [Arg]), State) ->
-  case maps:is_key(Var, State) of
+optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?match_var(Var), [Arg]), State = {_, LocalBindings}) ->
+  case maps:is_key(Var, LocalBindings) of
+    true ->
+      {replace, Arg, State};
+    false ->
+      {undefined, State}
+  end;
+
+optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?local_call(Name), [Arg]), State = {GlobalBindings, _}) ->
+  case maps:is_key(Name, GlobalBindings) of
     true ->
       {replace, Arg, State};
     false ->
@@ -294,11 +317,17 @@ optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?match_var(Var), [Arg]), 
 optimise_unsafeCoerce_remove_calls(_Form, State) ->
   {undefined, State}.
 
-gather_unsafecoerce_funs(?match_match(?match_var(Name),
-                                      ?match_remote_fun(?match_atom(unsafe_coerce@ps), ?match_atom(unsafeCoerce), ?match_integer(1))), Acc) ->
+gather_local_unsafecoerce_bindings(?match_match(?match_var(Name),
+                                          ?match_remote_fun(?match_atom(unsafe_coerce@ps), ?match_atom(unsafeCoerce), ?match_integer(1))), Acc) ->
   maps:put(Name, undefined, Acc);
 
-gather_unsafecoerce_funs(_Form, Acc) ->
+gather_local_unsafecoerce_bindings(_Form, Acc) ->
+  Acc.
+
+gather_global_unsafecoerce_bindings(?match_function(Name, 0, [?match_clause([], [], [?match_remote_fun(?match_atom(unsafe_coerce@ps), ?match_atom(unsafeCoerce), ?match_integer(1))])]), Acc) ->
+  maps:put(Name, undefined, Acc);
+
+gather_global_unsafecoerce_bindings(_Form, Acc) ->
   Acc.
 
 %%------------------------------------------------------------------------------
@@ -532,6 +561,7 @@ unroll_form(_Form = ?match_case(?match_tuple(Elements), Clauses), State) ->
 unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', insert), [Key, Value, Map]), State) ->
   {replace, {map, 0, Map, [{map_field_assoc, 0, Key, Value}]}, State};
 
+%% case Map.lookup x of Just j -> jjj; Nothing -> nnn
 unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]),
                                 [ ?match_clause([?match_tuple([?match_atom("just"), ?match_var(Var)])], [], JustBody)
                                 , ?match_clause([?match_tuple([?match_atom("nothing")])], [], NothingBody)
@@ -541,16 +571,23 @@ unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', look
                        , ?make_clause([?make_atom(error)], [], NothingBody)
                        ]), State};
 
+%% case Map.lookup x of Nothing -> nnn; Just j -> jjj
 unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]),
                                 [ ?match_clause([?match_tuple([?match_atom(nothing)])], [], NothingBody)
                                 , ?match_clause([?match_tuple([?match_atom(just), ?match_var(Var)])], [], JustBody)
                                 ]), State) ->
+io:format(user, "HERE ~p~n", [{Key, Map}]),
   {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
                        [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], JustBody)
                        , ?make_clause([?make_atom(error)], [], NothingBody)
                        ]), State};
 
+unroll_form(_Form = ?match_case(_, _), State) ->
+io:format(user, "HERE 3 ~p~n", [_Form]),
+  {undefined, State};
+
 unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]), State = #unroll_state{n = N}) ->
+io:format(user, "HERE 2 ~p~n", [{Key, Map}]),
   Var = list_to_atom("__@M" ++ integer_to_list(N)),
   {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
               [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], [?make_tuple([?make_atom(just), ?make_var(Var)])])
@@ -591,78 +628,60 @@ unroll_form(_Form = ?match_call(?remote_call('control_monad_reader_trans@ps', 'r
 unroll_form(_Form, State) ->
   {undefined, State}.
 
-%% we have a list of the tuple elements in `case {a, b, c} of`, and a list of the clauses.  Each clause *must* also be a tuple of the same arity
+%% we have a list of the tuple elements in `case {a, b, c} of`, and a list of the clauses.  Each clause *must* also be a tuple of the same arity -
+%% clauses that are not tuples (e.g., a catch all) will cause us to not optimise the case statement
 unroll_tuple_clauses(Elements, Clauses) ->
-  ElementsFromClauses = [ClauseElements || ?match_clause([?match_tuple(ClauseElements)], _, _) <- Clauses],
-  Paired = pair_elements(Elements, ElementsFromClauses),
-
-  UnrolledPaired = unroll_tuple_clauses_inner(Paired),
-
-  {Elements2, ElementsFromClauses2} = unpair_elements(UnrolledPaired),
-  {Elements2, lists:map(fun({ElementsFromClause, ?match_clause(_, Guards, Body)}) ->
-                            ?make_clause([?make_tuple(ElementsFromClause)], Guards, Body)
-                        end,
-                        lists:zip(ElementsFromClauses2, Clauses))}.
-
-unroll_tuple_clauses_inner([]) ->
-  [];
-unroll_tuple_clauses_inner([{?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]), Clauses} | T]) ->
   try
-    [{List, [begin
-                 ?match_clause([Args], _Guards, _Body) = unroll_uncons_clause(Clause, undefined, undefined),
-                 Args
-             end
-             || Clause <- Clauses]} | unroll_tuple_clauses_inner(T)]
+    {ClausesArgs, ClausesGuards, ClausesBodies} =
+      lists:unzip3([{ClauseArgs, ClauseGuards, ClauseBody} || ?match_clause([?match_tuple(ClauseArgs)], ClauseGuards, ClauseBody) <- Clauses]),
+
+    if length(Clauses) /= length(ClausesArgs) -> throw(not_all_clauses_are_tuples);
+       true -> ok
+    end,
+
+    {Elements2, Clauses2} = unroll_tuple_clauses_(Elements, ClausesArgs, ClausesGuards, ClausesBodies, [], [[] || _ <- Clauses]),
+
+    {Elements2, Clauses2}
   catch
-    _:_ ->
-      io:format(user, "FAILED TO DEAL WITH ~p~n", [Clauses]),
-      [{List, Clauses} | unroll_tuple_clauses_inner(T)]
-  end;
-
-unroll_tuple_clauses_inner([H | T]) ->
-  [H | unroll_tuple_clauses_inner(T)].
-
-%% we have {[a, b], [[1, 4], [2, 5], [3, 6]]}
-%% we want [{a, [1, 2, 3]}, {b, [4, 5, 6]}]
-pair_elements([], _) ->
-  [];
-pair_elements([H | T], Clauses) ->
-  {FirstElementsFromClauses, Clauses2} = take_first(Clauses),
-  [{H, FirstElementsFromClauses} | pair_elements(T, Clauses2)].
-
-take_first(Clauses) ->
-  take_first(Clauses, {[], []}).
-
-take_first([], {FirstElements, Clauses}) ->
-  {lists:reverse(FirstElements), lists:reverse(Clauses)};
-
-take_first([[] | RemainingClauses], {ElementsAcc, ClausesAcc}) ->
-  take_first(RemainingClauses, {ElementsAcc, ClausesAcc});
-
-take_first([[First | RemainingElementsInThisClause] | RemainingClauses], {ElementsAcc, ClausesAcc}) ->
-  take_first(RemainingClauses, {[First | ElementsAcc], [RemainingElementsInThisClause | ClausesAcc]}).
-
-%% we have [{a, [1, 2, 3]}, {b, [4, 5, 6]}]
-%% we want {[a, b], [[1, 4], [2, 5], [3, 6]]}
-unpair_elements(Pairs) ->
-  %% this gets us {[a, b], [[1, 2, 3], [4, 5, 6]]}
-  {Elements, Clauses} = lists:unzip(Pairs),
-
-  {Elements, unpair_clauses(Clauses)}.
-
-unpair_clauses([]) ->
-  [];
-unpair_clauses(Clauses) ->
-  case take_first(Clauses) of
-    {[], Clauses2} ->
-      unpair_clauses(Clauses2);
-    {FirstElementsFromClauses, Clauses2} ->
-      [FirstElementsFromClauses | unpair_clauses(Clauses2)]
+    A:B:S ->
+      io:format(user, "TUPLE FAILED TO DEAL WITH ~p / ~p~n  DUE TO ~p / ~p~n  AT ~p~n", [Elements, Clauses, A, B, S]),
+      {Elements, Clauses}
   end.
 
+unroll_tuple_clauses_([], _ClausesArgs, ClausesGuards, ClausesBodies, ElementsAcc, ArgsAcc) ->
+  %% ClausesArgs will be a list where every element is the empty list
+  {lists:reverse(ElementsAcc), [?make_clause([?make_tuple(Args)], Guards, Body) || {Args, Guards, Body} <- lists:zip3([lists:reverse(Args) || Args <- ArgsAcc], ClausesGuards, ClausesBodies)]};
+
+unroll_tuple_clauses_([HElement | TElements], ClausesArgs, ClausesGuards, ClausesBodies, ElementsAcc, ArgsAcc) ->
+
+  {ThisElementArgs, RemainingArgs} = lists:unzip([{H, T} || [H | T] <- ClausesArgs]),
+
+  {NewHeadElement, NewThisElementArgs, NewClausesGuards, NewClausesBodies} = unroll_tuple_clauses__(HElement, ThisElementArgs, ClausesGuards, ClausesBodies),
+
+  NewArgsAcc = [[New | Acc] || {New, Acc} <- lists:zip(NewThisElementArgs, ArgsAcc)],
+
+  unroll_tuple_clauses_(TElements, RemainingArgs, NewClausesGuards, NewClausesBodies, [NewHeadElement | ElementsAcc], NewArgsAcc).
+
+unroll_tuple_clauses__(?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]), ThisElementArgs, ClausesGuards, ClausesBodies) ->
+
+  {NewThisElementArgs, NewClausesGuards, NewClausesBodies} = lists:unzip3([begin
+     ?match_clause([NewArg], NewGuards, NewBody) = unroll_uncons_clause(Arg, Guards, Body),
+     {NewArg, NewGuards, NewBody}
+   end || {Arg, Guards, Body} <- lists:zip3(ThisElementArgs, ClausesGuards, ClausesBodies)
+  ]),
+
+  {List, NewThisElementArgs, NewClausesGuards, NewClausesBodies};
+
+unroll_tuple_clauses__(ThisElement, ThisElementArgs, ClausesGuards, ClausesBodies) ->
+  %% We don't know how to unroll this tuple element in the case
+  {ThisElement, ThisElementArgs, ClausesGuards, ClausesBodies}.
+
+%% Looking for clauses of the form: Nothing -> [anything]
 unroll_uncons_clause(?match_tuple([?match_atom(nothing)]), Guards, Body) ->
     ?make_clause([?make_nil], Guards, Body);
 
+%% Looking for clauses of the form: Just {head: H, tail: T} -> [anything]
+%% In this case, H and T are exactly hd and tl of the erlang list, so we can just match on that
 unroll_uncons_clause(?match_tuple([?match_atom(just),
                                    ?match_map([ ?map_field_exact(?match_atom(head), H)
                                               , ?map_field_exact(?match_atom(tail), T)
@@ -670,6 +689,8 @@ unroll_uncons_clause(?match_tuple([?match_atom(just),
                      Guards, Body) ->
   ?make_clause([?make_cons(H, T)], Guards, Body);
 
+%% Looking for clauses of the form: Just {head: H} -> [anything]
+%% As above, just only capturing head
 unroll_uncons_clause(?match_tuple([?match_atom(just),
                                    ?match_map([ ?map_field_exact(?match_atom(head), H)
                                               ])]),
@@ -677,44 +698,58 @@ unroll_uncons_clause(?match_tuple([?match_atom(just),
   ?make_clause([?make_cons(H, ?make_var('_'))], Guards, Body);
 
 
+%% Looking for clauses of the form: Just {tail: T} -> [anything]
+%% As above, just only capturing tail
 unroll_uncons_clause(?match_tuple([?match_atom(just),
                                    ?match_map([ ?map_field_exact(?match_atom(tail), T)
                                               ])]),
                      Guards, Body) ->
   ?make_clause([?make_cons(?make_var('_'), T)], Guards, Body);
 
+%% Looking for clauses of the form: {just, Val} -> Val
+%% This is capturing a non-empty list, but the {head, tail} record is being returned, so we need to make the map (and no guard in play)
 unroll_uncons_clause(?match_tuple([?match_atom(just), ?match_var(L)]), [], [?match_var(L)]) ->
     H = list_to_atom("__H_" ++ atom_to_list(L)),
     T = list_to_atom("__T_" ++ atom_to_list(L)),
     ?make_clause([?make_cons(?make_var(H), ?make_var(T))], [], [?make_map([?make_map_field(?make_atom(head), ?make_var(H)), ?make_map_field(?make_atom(tail), ?make_var(T))])]);
 
+%% Looking for clauses of the form: {just, Val} -> Val
+%% This is capturing a non-empty list, but the {head, tail} record is potentially being used in the body, so we need to make the map as the first part of the body (also no guard in play)
+unroll_uncons_clause(?match_tuple([?match_atom(just), ?match_var(L)]), [], Body) ->
+    H = list_to_atom("__H_" ++ atom_to_list(L)),
+    T = list_to_atom("__T_" ++ atom_to_list(L)),
+
+    %% If the only reference to var(L) in the body is to do a maps:get(head) or a maps:get(tail), then we can drop those...
+    {NewBody, _} = modify(Body, fun preIdentity/2, fun remove_head_tail_lookup/2, {L, H, T}),
+
+    {NeedDict, _} = walk(NewBody, fun variable_is_used/2, {false, L}),
+
+    NewBody2 = if
+                 NeedDict -> [?make_match(?make_var(L), ?make_map([?make_map_field(?make_atom(head), ?make_var(H)), ?make_map_field(?make_atom(tail), ?make_var(T))]))
+                             | NewBody
+                             ];
+                 true -> NewBody
+               end,
+
+    ?make_clause([?make_cons(?make_var(H), ?make_var(T))], [], NewBody2);
+
+%% This is a catch-all, so we can just use it
 unroll_uncons_clause(CatchAll = ?match_var('_'), Guards, Body) ->
   ?make_clause([CatchAll], Guards, Body).
 
-%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(nothing)])], NothingGuards, NothingBody)) ->
-%%   ?make_clause([?make_nil], NothingGuards, NothingBody);
+remove_head_tail_lookup(?match_call(?remote_call('maps', 'get'), [?match_atom('head'), ?match_var(L)]), State = {L, H, _T}) ->
+  {?make_var(H), State};
 
-%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just),
-%%                                                   ?match_map([ ?map_field_exact(?match_atom(head), H)
-%%                                                              , ?map_field_exact(?match_atom(tail), T)
-%%                                                              ])])], JustGuards, JustBody)) ->
-%%   ?make_clause([?make_cons(H, T)], JustGuards, JustBody);
+remove_head_tail_lookup(?match_call(?remote_call('maps','get'), [?match_atom('tail'), ?match_var(L)]), State = {L, _H, T}) ->
+  {?make_var(T), State};
 
-%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just),
-%%                                                   ?match_map([ ?map_field_exact(?match_atom(head), H)
-%%                                                              ])])], JustGuards, JustBody)) ->
-%%   ?make_clause([?make_cons(H, ?make_var('_'))], JustGuards, JustBody);
+remove_head_tail_lookup(Form, State) ->
+  {Form, State}.
 
-%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just),
-%%                                                   ?match_map([ ?map_field_exact(?match_atom(tail), T)
-%%                                                              ])])], JustGuards, JustBody)) ->
-%%   ?make_clause([?make_cons(?make_var('_'), T)], JustGuards, JustBody);
-
-%% unroll_uncons_clause(?match_clause([?match_tuple([?match_atom(just), L])], JustGuards, JustBody)) ->
-%%   ?make_clause([L], JustGuards, JustBody);
-
-%% unroll_uncons_clause(CatchAll = ?match_clause([?match_var('_')], _, _)) ->
-%%   CatchAll.
+variable_is_used(?match_var(L), {_, L}) ->
+  {true, L};
+variable_is_used(_, Acc) ->
+  Acc.
 
 %%------------------------------------------------------------------------------
 %%-- Look for specific applications of effectful funs and rewrite then
