@@ -522,10 +522,11 @@ inline_uncons_inline_case(Form, State) ->
        }).
 
 unroll({Forms, UnmemoiseMap}) ->
-  {NewForms, _} = modify(Forms, fun unroll_form/2, fun postIdentity/2, #unroll_state{unmemoise_map = UnmemoiseMap, n = 0}),
+%%  {NewForms, _} = modify(Forms, fun unroll_form/2, fun postIdentity/2, #unroll_state{unmemoise_map = UnmemoiseMap, n = 0}),
+  {NewForms, _} = modify(Forms, fun preIdentity/2, fun unroll_form/2, #unroll_state{unmemoise_map = UnmemoiseMap, n = 0}),
   NewForms.
 
-unroll_form(_Form = ?match_call(
+unroll_form(Form = ?match_call(
                        ?match_call(
                           ?match_call(?local_call(Name), []),
                           [Arg1]),
@@ -534,39 +535,39 @@ unroll_form(_Form = ?match_call(
 
   case maps:find(Name, State#unroll_state.unmemoise_map) of
     error ->
-      {undefined, State};
+      {Form, State};
     {ok, Replacement} ->
-      {replace, ?make_call(Replacement, [Arg1, Arg2]), State}
+      {?make_call(Replacement, [Arg1, Arg2]), State}
   end;
 
-unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]),
+unroll_form(Form = ?match_case(?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]),
                                 Clauses
                                ), State) ->
   try
     Clauses2 = [unroll_uncons_clause(Match, Guards, Body) || ?match_clause([Match], Guards, Body) <- Clauses],
     Form = ?make_case(List, Clauses2),
-    {replace, Form, State}
+    {Form, State}
   catch _:_ ->
       io:format(user, "FAILED TO DEAL WITH ~p~n", [Clauses]),
-      {undefined, State}
+      {Form, State}
   end;
 
-unroll_form(_Form = ?match_case(?match_tuple([]), _Clauses), State) ->
-  {undefined, State};
+unroll_form(Form = ?match_case(?match_tuple([]), _Clauses), State) ->
+  {Form, State};
 
 unroll_form(_Form = ?match_case(?match_tuple(Elements), Clauses), State) ->
   {Elements2, Clauses2} = unroll_tuple_clauses(Elements, Clauses),
-  {replace, ?make_case(?make_tuple(Elements2), Clauses2), State};
+  {?make_case(?make_tuple(Elements2), Clauses2), State};
 
 unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', insert), [Key, Value, Map]), State) ->
-  {replace, {map, 0, Map, [{map_field_assoc, 0, Key, Value}]}, State};
+  {{map, 0, Map, [{map_field_assoc, 0, Key, Value}]}, State};
 
 %% case Map.lookup x of Just j -> jjj; Nothing -> nnn
 unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]),
                                 [ ?match_clause([?match_tuple([?match_atom("just"), ?match_var(Var)])], [], JustBody)
                                 , ?match_clause([?match_tuple([?match_atom("nothing")])], [], NothingBody)
                                 ]), State) ->
-  {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
+  {?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
                        [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], JustBody)
                        , ?make_clause([?make_atom(error)], [], NothingBody)
                        ]), State};
@@ -577,19 +578,19 @@ unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', look
                                 , ?match_clause([?match_tuple([?match_atom(just), ?match_var(Var)])], [], JustBody)
                                 ]), State) ->
 io:format(user, "HERE ~p~n", [{Key, Map}]),
-  {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
+  {?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
                        [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], JustBody)
                        , ?make_clause([?make_atom(error)], [], NothingBody)
                        ]), State};
 
-unroll_form(_Form = ?match_case(_, _), State) ->
+unroll_form(Form = ?match_case(_, _), State) ->
 io:format(user, "HERE 3 ~p~n", [_Form]),
-  {undefined, State};
+  {Form, State};
 
 unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]), State = #unroll_state{n = N}) ->
 io:format(user, "HERE 2 ~p~n", [{Key, Map}]),
   Var = list_to_atom("__@M" ++ integer_to_list(N)),
-  {replace, ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
+  {?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
               [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], [?make_tuple([?make_atom(just), ?make_var(Var)])])
               , ?make_clause([?make_atom(error)], [], [?make_tuple([?make_atom(nothing)])])
               ]), State#unroll_state{n = N + 1}};
@@ -599,7 +600,7 @@ unroll_form(_Form = ?match_call(?remote_call('data_maybe@ps', 'fromMaybe\''),
              State = #unroll_state{n = N}) ->
 
   Var = list_to_atom("__@M" ++ integer_to_list(N)),
-  {replace, ?make_case(Value, [ ?make_clause([?make_tuple([?make_atom(nothing)])], [], [?make_call(DefaultFn, [?make_atom(unit)])])
+  {?make_case(Value, [ ?make_clause([?make_tuple([?make_atom(nothing)])], [], [?make_call(DefaultFn, [?make_atom(unit)])])
                               , ?make_clause([?make_tuple([?make_atom(just), ?make_var(Var)])], [], [?make_var(Var)])
                               ]), State#unroll_state{n = N + 1}};
 
@@ -614,19 +615,19 @@ unroll_form(_Form = ?match_call(
                  'Left' -> left;
                  'Right' -> right
                end,
-  {replace, ?make_tuple([?make_atom(EitherType), Arg1]), State#unroll_state{n = N + 1}};
+  {?make_tuple([?make_atom(EitherType), Arg1]), State#unroll_state{n = N + 1}};
 
 unroll_form(_Form = ?match_call(_Call = ?remote_call('foreign@ps', 'unsafeFromForeign'), [Arg]),
              State) ->
-  {replace, Arg, State};
+  {Arg, State};
 
 unroll_form(_Form = ?match_call(?remote_call('control_monad_reader_trans@ps', 'runReaderT'),
                                 [Fn, Context]
                                ), State) ->
-  {replace, ?make_call(Fn, [Context]), State};
+  {?make_call(Fn, [Context]), State};
 
-unroll_form(_Form, State) ->
-  {undefined, State}.
+unroll_form(Form, State) ->
+  {Form, State}.
 
 %% we have a list of the tuple elements in `case {a, b, c} of`, and a list of the clauses.  Each clause *must* also be a tuple of the same arity -
 %% clauses that are not tuples (e.g., a catch all) will cause us to not optimise the case statement
