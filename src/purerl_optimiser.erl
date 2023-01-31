@@ -13,39 +13,7 @@
         , postIdentity/2
         ]).
 
--define(match_function(Name, Arity, Clauses), {function, _, Name, Arity, Clauses}).
--define(match_local_fun(Name, Arity), {'fun', _, {function, Name, Arity}}).
--define(match_remote_fun(Module, Name, Arity), {'fun', _, {function, Module, Name, Arity}}).
--define(match_clause(Args, Guards, Body), {clause, _, Args, Guards, Body}).
--define(match_block(Body), {block, _, Body}).
--define(match_case(Value, Clauses), {'case', _, Value, Clauses}).
--define(match_call(Fun, Args), {call, _, Fun, Args}).
--define(local_call(Fun), {atom, _, Fun}).
--define(remote_call(Mod, Fun), {remote, _, {atom, _, Mod}, {atom, _, Fun}}).
--define(match_match(Lhs, Rhs), {match, _, Lhs, Rhs}).
--define(match_tuple(Entries), {tuple, _, Entries}).
--define(match_atom(Atom), {atom, _, Atom}).
--define(match_integer(Int), {integer, _, Int}).
--define(match_var(Name), {var, _, Name}).
--define(match_map(Fields), {map, _, Fields}).
--define(map_field_exact(Name, Value), {map_field_exact, _, Name, Value}).
--define(map_field(Name, Value), {map_field_assoc, _, Name, Value}).
-
--define(make_call(Fun, Args), {call, 0, Fun, Args}).
--define(make_local_call(Name), ?make_atom(Name)).
--define(make_remote_call(Mod, Fun), {remote, 0, ?make_atom(Mod), ?make_atom(Fun)}).
--define(make_lambda(Clauses), {'fun', 0, {clauses, Clauses}}).
--define(make_atom(Name), {atom, 0, Name}).
--define(make_var(Name), {var, 0, Name}).
--define(make_clause(Args, Guards, Body), {clause, 0, Args, Guards, Body}).
--define(make_block(Body), {block, 0, Body}).
--define(make_case(Value, Clauses), {'case', 0, Value, Clauses}).
--define(make_tuple(Items), {tuple, 0, Items}).
--define(make_nil, {nil, 0}).
--define(make_cons(H, T), {cons, 0, H, T}).
--define(make_map(Fields), {map, 0, Fields}).
--define(make_map_field(Name, Value), {map_field_assoc, 0, Name, Value}).
--define(make_match(Lhs, Rhs), {match, 0, Lhs, Rhs}).
+-include("../include/purerl_optimiser.hrl").
 
 parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module} | _], CompileOptions) ->
 
@@ -53,6 +21,7 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
 
   case is_purs(Module) of
     true ->
+      put('__module', Module),
       Final = lists:foldl(fun(Fn, Acc) ->
                               Fn(Acc)
                           end,
@@ -110,7 +79,7 @@ optimise_discard_form(_Form = ?match_call(?local_call('memoize'),
   {replace, NewForm, State};
 
 optimise_discard_form(_Form, State) ->
-  {undefined, State}.
+  {continue, State}.
 
 %%------------------------------------------------------------------------------
 %%-- Remove newtype over / lens over
@@ -288,7 +257,7 @@ optimise_unsafeCoerce_forms(FunForm = ?match_function(_Name, _Arity, Clauses), G
   {replace, NewForm, GlobalBindings};
 
 optimise_unsafeCoerce_forms(_Form, State) ->
-  {undefined, State}.
+  {continue, State}.
 
 optimise_unsafeCoerce_funs(?match_clause(Args, Guards, Body), State) ->
   {NewBody, _} = modify(Body, fun optimise_unsafeCoerce_remove_calls/2, fun postIdentity/2, State),
@@ -296,14 +265,14 @@ optimise_unsafeCoerce_funs(?match_clause(Args, Guards, Body), State) ->
   {replace, ?make_clause(Args, Guards, NewBody), State};
 
 optimise_unsafeCoerce_funs(_Form, State) ->
-  {undefined, State}.
+  {continue, State}.
 
 optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?match_var(Var), [Arg]), State = {_, LocalBindings}) ->
   case maps:is_key(Var, LocalBindings) of
     true ->
       {replace, Arg, State};
     false ->
-      {undefined, State}
+      {continue, State}
   end;
 
 optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?local_call(Name), [Arg]), State = {GlobalBindings, _}) ->
@@ -311,11 +280,11 @@ optimise_unsafeCoerce_remove_calls(_Form = ?match_call(?local_call(Name), [Arg])
     true ->
       {replace, Arg, State};
     false ->
-      {undefined, State}
+      {continue, State}
   end;
 
 optimise_unsafeCoerce_remove_calls(_Form, State) ->
-  {undefined, State}.
+  {continue, State}.
 
 gather_local_unsafecoerce_bindings(?match_match(?match_var(Name),
                                           ?match_remote_fun(?match_atom(unsafe_coerce@ps), ?match_atom(unsafeCoerce), ?match_integer(1))), Acc) ->
@@ -457,10 +426,10 @@ unmemoise_form(?match_function(Name, 0, [?match_clause([], [],
 
   Replacement = ?make_remote_call(lists, AllOrAny),
 
-  {undefined, maps:put(Name, Replacement, State)};
+  {continue, maps:put(Name, Replacement, State)};
 
 unmemoise_form(_Form, State) ->
-  {undefined, State}.
+  {continue, State}.
 
 %%------------------------------------------------------------------------------
 %%-- Inline - we are looking for things like
@@ -476,25 +445,37 @@ inline(Forms) ->
 
 inline_form(_Form = ?match_clause(Args, Guards, Body), State) ->
   Body2 = inline_uncons(Body),
-  {?make_clause(Args, Guards, Body2), State};
+  Body3 = inline_lookup(Body2),
+  {?make_clause(Args, Guards, Body3), State};
 
 inline_form(_Form = ?match_block(Body), State) ->
   Body2 = inline_uncons(Body),
-  {?make_block(Body2), State};
+  Body3 = inline_lookup(Body2),
+  {?make_block(Body3), State};
 
 inline_form(Form, State) ->
   {Form, State}.
 
-inline_uncons([Match = ?match_match(?match_var(Res), Call = ?match_call(?remote_call('erl_data_list_types@ps', uncons), [_List]))
-               | T]) ->
+inline_uncons([Match = ?match_match(?match_var(Var), Call) | T]) ->
+  CanInline = case Call of
+                ?match_call(?remote_call('erl_data_list_types@ps', uncons), [_List]) -> true;
+                ?match_call(?remote_call('erl_data_list@ps', head), [_List]) -> true;
+                ?match_call(?remote_call('erl_data_map@ps', lookup), [_Key, _Map]) -> true;
+                _ -> false
+              end,
 
-  case walk(T, fun(Form, Acc) -> inline_count_var(Res, Form, Acc) end, 0) of
-    1 ->
-      %% We can do it
-      {Inlined, _} = modify(T, fun preIdentity/2, fun inline_uncons_inline_case/2, {Call, Res}),
-      inline_uncons(Inlined);
-    _N ->
-      %% Nope, variable is reused
+  if
+    CanInline ->
+      case walk(T, fun(Form, Acc) -> inline_count_var(Var, Form, Acc) end, 0) of
+        1 ->
+          %% We can do it
+          {Inlined, _} = modify(T, fun preIdentity/2, fun inline_var/2, {Call, Var}),
+          inline_uncons(Inlined);
+        _N ->
+          %% Nope, variable is reused
+          [Match | inline_uncons(T)]
+      end;
+    true ->
       [Match | inline_uncons(T)]
   end;
 
@@ -504,14 +485,32 @@ inline_uncons([H | T]) ->
 inline_uncons([]) ->
   [].
 
+inline_lookup([Match = ?match_match(?match_var(Var), Call = ?match_call(?remote_call('erl_data_map@ps', lookup), [_Key, _Map]))
+               | T]) ->
+  case walk(T, fun(Form, Acc) -> inline_count_var(Var, Form, Acc) end, 0) of
+    1 ->
+      %% We can do it
+      {Inlined, _} = modify(T, fun preIdentity/2, fun inline_var/2, {Call, Var}),
+      inline_lookup(Inlined);
+    _N ->
+      %% Nope, variable is reused
+      [Match | inline_lookup(T)]
+  end;
+
+inline_lookup([H | T]) ->
+  [H | inline_lookup(T)];
+
+inline_lookup([]) ->
+  [].
+
 inline_count_var(Var, ?match_var(Var), N) ->
   N + 1;
 inline_count_var(_, _, N) ->
   N.
 
-inline_uncons_inline_case(_Form = ?match_var(Var), State = {Call, Var}) ->
+inline_var(_Form = ?match_var(Var), State = {Call, Var}) ->
   {Call, State};
-inline_uncons_inline_case(Form, State) ->
+inline_var(Form, State) ->
   {Form, State}.
 
 %%------------------------------------------------------------------------------
@@ -522,9 +521,23 @@ inline_uncons_inline_case(Form, State) ->
        }).
 
 unroll({Forms, UnmemoiseMap}) ->
-%%  {NewForms, _} = modify(Forms, fun unroll_form/2, fun postIdentity/2, #unroll_state{unmemoise_map = UnmemoiseMap, n = 0}),
-  {NewForms, _} = modify(Forms, fun preIdentity/2, fun unroll_form/2, #unroll_state{unmemoise_map = UnmemoiseMap, n = 0}),
+  {NewForms, _} = modify(Forms, fun unroll_form_down/2, fun unroll_form/2, #unroll_state{unmemoise_map = UnmemoiseMap, n = 0}),
   NewForms.
+
+%% case Map.lookup x of Just j -> jjj; Nothing -> nnn
+unroll_form_down(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]), Clauses), State) ->
+
+  try
+    Clauses2 = [unroll_lookup_clause(Match, Guards, Body) || ?match_clause([Match], Guards, Body) <- Clauses],
+    NewForm = ?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]), Clauses2),
+    {replace_and_continue, NewForm, State}
+  catch _:_ ->
+      io:format(user, "~p: Unrolling map lookup - failed to deal with ~p~n", [get('__module'), Clauses]),
+      {continue, State}
+  end;
+
+unroll_form_down(_Form, State) ->
+  {continue, State}.
 
 unroll_form(Form = ?match_call(
                        ?match_call(
@@ -540,15 +553,26 @@ unroll_form(Form = ?match_call(
       {?make_call(Replacement, [Arg1, Arg2]), State}
   end;
 
+%% case List.head.lookup x of Just j -> jjj; Nothing -> nnn
+unroll_form(Form = ?match_case(?match_call(?remote_call('erl_data_list@ps', head), [List]), Clauses), State) ->
+  try
+    Clauses2 = [unroll_head_clause(Match, Guards, Body) || ?match_clause([Match], Guards, Body) <- Clauses],
+    NewForm = ?make_case(List, Clauses2),
+    {NewForm, State}
+  catch _:_ ->
+      io:format(user, "~p: Unrolling list head - failed to deal with ~p~n", [get('__module'), Clauses]),
+      {Form, State}
+  end;
+
 unroll_form(Form = ?match_case(?match_call(?remote_call('erl_data_list_types@ps', uncons), [List]),
                                 Clauses
                                ), State) ->
   try
     Clauses2 = [unroll_uncons_clause(Match, Guards, Body) || ?match_clause([Match], Guards, Body) <- Clauses],
-    Form = ?make_case(List, Clauses2),
-    {Form, State}
+    NewForm = ?make_case(List, Clauses2),
+    {NewForm, State}
   catch _:_ ->
-      io:format(user, "FAILED TO DEAL WITH ~p~n", [Clauses]),
+      io:format(user, "~p: Unrolling list uncons - failed to deal with ~p~n", [get('__module'), Clauses]),
       {Form, State}
   end;
 
@@ -562,33 +586,8 @@ unroll_form(_Form = ?match_case(?match_tuple(Elements), Clauses), State) ->
 unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', insert), [Key, Value, Map]), State) ->
   {{map, 0, Map, [{map_field_assoc, 0, Key, Value}]}, State};
 
-%% case Map.lookup x of Just j -> jjj; Nothing -> nnn
-unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]),
-                                [ ?match_clause([?match_tuple([?match_atom("just"), ?match_var(Var)])], [], JustBody)
-                                , ?match_clause([?match_tuple([?match_atom("nothing")])], [], NothingBody)
-                                ]), State) ->
-  {?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
-                       [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], JustBody)
-                       , ?make_clause([?make_atom(error)], [], NothingBody)
-                       ]), State};
-
-%% case Map.lookup x of Nothing -> nnn; Just j -> jjj
-unroll_form(_Form = ?match_case(?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]),
-                                [ ?match_clause([?match_tuple([?match_atom(nothing)])], [], NothingBody)
-                                , ?match_clause([?match_tuple([?match_atom(just), ?match_var(Var)])], [], JustBody)
-                                ]), State) ->
-io:format(user, "HERE ~p~n", [{Key, Map}]),
-  {?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
-                       [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], JustBody)
-                       , ?make_clause([?make_atom(error)], [], NothingBody)
-                       ]), State};
-
-unroll_form(Form = ?match_case(_, _), State) ->
-io:format(user, "HERE 3 ~p~n", [_Form]),
-  {Form, State};
-
 unroll_form(_Form = ?match_call(?remote_call('erl_data_map@ps', lookup), [Key, Map]), State = #unroll_state{n = N}) ->
-io:format(user, "HERE 2 ~p~n", [{Key, Map}]),
+
   Var = list_to_atom("__@M" ++ integer_to_list(N)),
   {?make_case(?make_call(?make_remote_call(maps, find), [Key, Map]),
               [ ?make_clause([?make_tuple([?make_atom(ok), ?make_var(Var)])], [], [?make_tuple([?make_atom(just), ?make_var(Var)])])
@@ -645,7 +644,7 @@ unroll_tuple_clauses(Elements, Clauses) ->
     {Elements2, Clauses2}
   catch
     A:B:S ->
-      io:format(user, "TUPLE FAILED TO DEAL WITH ~p / ~p~n  DUE TO ~p / ~p~n  AT ~p~n", [Elements, Clauses, A, B, S]),
+      io:format(user, "~p: Unrolling tuple clauses failed to deal with ~p / ~p~n  due to ~p / ~p~n  at ~p~n", [get('__module'), Elements, Clauses, A, B, S]),
       {Elements, Clauses}
   end.
 
@@ -677,6 +676,7 @@ unroll_tuple_clauses__(ThisElement, ThisElementArgs, ClausesGuards, ClausesBodie
   %% We don't know how to unroll this tuple element in the case
   {ThisElement, ThisElementArgs, ClausesGuards, ClausesBodies}.
 
+%% Unroll clauses from an uncons...
 %% Looking for clauses of the form: Nothing -> [anything]
 unroll_uncons_clause(?match_tuple([?match_atom(nothing)]), Guards, Body) ->
     ?make_clause([?make_nil], Guards, Body);
@@ -736,6 +736,26 @@ unroll_uncons_clause(?match_tuple([?match_atom(just), ?match_var(L)]), [], Body)
 
 %% This is a catch-all, so we can just use it
 unroll_uncons_clause(CatchAll = ?match_var('_'), Guards, Body) ->
+  ?make_clause([CatchAll], Guards, Body).
+
+%% Unroll clauses from a head...
+unroll_head_clause(?match_tuple([?match_atom(just), Var]), [], JustBody) ->
+  ?make_clause([?make_cons(Var, ?make_var('_'))], [], JustBody);
+
+unroll_head_clause(?match_tuple([?match_atom(nothing)]), [], NothingBody) ->
+  ?make_clause([?make_nil], [], NothingBody);
+
+unroll_head_clause(CatchAll = ?match_var('_'), Guards, Body) ->
+  ?make_clause([CatchAll], Guards, Body).
+
+%% Unroll clauses from a map lookup
+unroll_lookup_clause(?match_tuple([?match_atom(just), Var]), [], JustBody) ->
+  ?make_clause([?make_tuple([?make_atom(ok), Var])], [], JustBody);
+
+unroll_lookup_clause(?match_tuple([?match_atom(nothing)]), [], NothingBody) ->
+  ?make_clause([?make_atom(error)], [], NothingBody);
+
+unroll_lookup_clause(CatchAll = ?match_var('_'), Guards, Body) ->
   ?make_clause([CatchAll], Guards, Body).
 
 remove_head_tail_lookup(?match_call(?remote_call('maps', 'get'), [?match_atom('head'), ?match_var(L)]), State = {L, H, _T}) ->
@@ -885,7 +905,7 @@ find_memoisable_terms(?match_call(?local_call('memoize'), [Call = ?match_call(Fn
   {replace, MemoisedLookup, State2};
 
 find_memoisable_terms(_, State) ->
-  {undefined, State}.
+  {continue, State}.
 
 remove_line_numbers(Form, State) when is_tuple(Form) ->
   {setelement(2, Form, 0), State};
@@ -911,7 +931,7 @@ gather_free_variables_pre_(_Form = {clause, _, Variables, _Guards, _Body}, State
 
   InScope2 = lists:foldl(fun(Name, Acc) -> sets:add_element(Name, Acc) end, InScope, Names),
   Stack2 = [InScope | Stack],
-  {undefined, State#free_variables_state{inScope = InScope2, scopeStack = Stack2}};
+  {continue, State#free_variables_state{inScope = InScope2, scopeStack = Stack2}};
 
 gather_free_variables_pre_(_Form = {match, _, Lhs, _Rhs}, State = #free_variables_state{inScope = InScope, scopeStack = Stack}) ->
   {_, Variables2, _} = gather_free_variables([Lhs]),
@@ -919,10 +939,10 @@ gather_free_variables_pre_(_Form = {match, _, Lhs, _Rhs}, State = #free_variable
 
   InScope2 = lists:foldl(fun(Name, Acc) -> sets:add_element(Name, Acc) end, InScope, Names),
   Stack2 = [InScope | Stack],
-  {undefined, State#free_variables_state{inScope = InScope2, scopeStack = Stack2}};
+  {continue, State#free_variables_state{inScope = InScope2, scopeStack = Stack2}};
 
 gather_free_variables_pre_(_Form, State) ->
-  {undefined, State}.
+  {continue, State}.
 
 gather_free_variables_post_(Form = {clause, _, _Variables, _Guards, _Body}, State = #free_variables_state{scopeStack = [_Prev | Stack]}) ->
   {Form, State#free_variables_state{scopeStack = Stack}};
@@ -960,7 +980,7 @@ purs_type_to_erl_([[H | Head], Type], Acc) ->
 purs_type_to_erl_([[H | Head] | Tail], Acc) ->
   purs_type_to_erl_(Tail, ["_", [string:to_lower(H) | Head] | Acc]).
 
-preIdentity(_, State) -> {undefined, State}.
+preIdentity(_, State) -> {continue, State}.
 postIdentity(X, State) -> {X, State}.
 
 %%------------------------------------------------------------------------------
@@ -1088,7 +1108,7 @@ walk(Form = {'map_field_assoc', _Line, Key, Value}, Fun, State) ->
 %% Modifier
 modify(List, PreFun, PostFun, State) when is_list(List) ->
   case PreFun(List, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Out, State3} = lists:foldl(fun(Item, {Acc, InnerState}) ->
                                       {Item2, InnerState2} = modify(Item, PreFun, PostFun, InnerState),
                                       {[Item2 | Acc], InnerState2}
@@ -1099,373 +1119,496 @@ modify(List, PreFun, PostFun, State) when is_list(List) ->
       PostFun(lists:reverse(Out), State3);
 
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {attribute, _, _, _}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun(Form, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {function, Line, Name, Arity, Body}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Body2, State3} = modify(Body, PreFun, PostFun, State2),
       PostFun({function, Line, Name, Arity, Body2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {eof, _Line}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun(Form, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {clause, Line, Args, Guards, Statements}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Args2, State3} = modify(Args, PreFun, PostFun, State2),
       {Guards2, State4} = modify(Guards, PreFun, PostFun, State3),
       {Statements2, State5} = modify(Statements, PreFun, PostFun, State4),
       PostFun({clause, Line, Args2, Guards2, Statements2}, State5);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'case', Line, Of, Clauses}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Of2, State3} = modify(Of, PreFun, PostFun, State2),
       {Clauses2, State4} = modify(Clauses, PreFun, PostFun, State3),
       PostFun({'case', Line, Of2, Clauses2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'block', Line, Statements}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Statements2, State3} = modify(Statements, PreFun, PostFun, State2),
       PostFun({'block', Line, Statements2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'match', Line, Var, Statement}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Statement2, State3} = modify(Statement, PreFun, PostFun, State2),
       PostFun({'match', Line, Var, Statement2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'call', Line, Target, Args}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Target2, State3} = modify(Target, PreFun, PostFun, State2),
       {Args2, State4} = modify(Args, PreFun, PostFun, State3),
       PostFun({'call', Line, Target2, Args2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'var', Line, Name}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'var', Line, Name}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'op', Line, Operator, Lhs, Rhs}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Lhs2, State3} = modify(Lhs, PreFun, PostFun, State2),
       {Rhs2, State4} = modify(Rhs, PreFun, PostFun, State3),
       PostFun({'op', Line, Operator, Lhs2, Rhs2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'op', Line, Operator, Lhs}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Lhs2, State3} = modify(Lhs, PreFun, PostFun, State2),
       PostFun({'op', Line, Operator, Lhs2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'integer', Line, Val}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'integer', Line, Val}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'float', Line, Val}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'float', Line, Val}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'bin', Line, Val}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'bin', Line, Val}, State2); %% TODO - recurse on value?
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'nil', Line}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'nil', Line}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'cons', Line, Head, Tail}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Head2, State3} = modify(Head, PreFun, PostFun, State2),
       {Tail2, State4} = modify(Tail, PreFun, PostFun, State3),
       PostFun({'cons', Line, Head2, Tail2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'remote', Line, Module, Name}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Module2, State3} = modify(Module, PreFun, PostFun, State2),
       {Name2, State4} = modify(Name, PreFun, PostFun, State3),
       PostFun({'remote', Line, Module2, Name2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'fun', Line, {clauses, Clauses}}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Clauses2, State3} = modify(Clauses, PreFun, PostFun, State2),
       PostFun({'fun', Line, {clauses, Clauses2}}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'fun', Line, {function, Module, Name, Arity}}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'fun', Line, {function, Module, Name, Arity}}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'fun', Line, {function, Name, Arity}}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'fun', Line, {function, Name, Arity}}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'named_fun', Line, Name, Clauses}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Clauses2, State3} = modify(Clauses, PreFun, PostFun, State2),
       PostFun({'named_fun', Line, Name, Clauses2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'tuple', Line, Statements}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Statements2, State3} = modify(Statements, PreFun, PostFun, State2),
       PostFun({'tuple', Line, Statements2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'map', Line, MapStatements}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {MapStatements2, State3} = modify(MapStatements, PreFun, PostFun, State2),
       PostFun({'map', Line, MapStatements2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'map', Line, Var, MapStatements}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Var2, State3} = modify(Var, PreFun, PostFun, State2),
       {MapStatements2, State4} = modify(MapStatements, PreFun, PostFun, State3),
       PostFun({'map', Line, Var2, MapStatements2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'lc', Line, Item, Generators}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Item2, State3} = modify(Item, PreFun, PostFun, State2),
       {Generators2, State4} = modify(Generators, PreFun, PostFun, State3),
       PostFun({'lc', Line, Item2, Generators2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'generate', Line, Var, Source}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Var2, State3} = modify(Var, PreFun, PostFun, State2),
       {Source2, State4} = modify(Source, PreFun, PostFun, State3),
       PostFun({'generate', Line, Var2, Source2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 %% todo
 modify(Form = {'try', Line, Call, Something, Clauses, SomethingElse}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Call2, State3} = modify(Call, PreFun, PostFun, State2),
       {Something2, State4} = modify(Something, PreFun, PostFun, State3),
       {Clauses2, State5} = modify(Clauses, PreFun, PostFun, State4),
       {SomethingElse2, State6} = modify(SomethingElse, PreFun, PostFun, State5),
       PostFun({'try', Line, Call2, Something2, Clauses2, SomethingElse2}, State6);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'receive', Line, Clauses}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Clauses2, State3} = modify(Clauses, PreFun, PostFun, State2),
       PostFun({'receive', Line, Clauses2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'receive', Line, Clauses, Delay, After}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Clauses2, State3} = modify(Clauses, PreFun, PostFun, State2),
       {Delay2, State4} = modify(Delay, PreFun, PostFun, State3),
       {After2, State5} = modify(After, PreFun, PostFun, State4),
       PostFun({'receive', Line, Clauses2, Delay2, After2}, State5);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'record', Line, Name, Fields}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Fields2, State3} = modify(Fields, PreFun, PostFun, State2),
       PostFun({'record', Line, Name, Fields2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'record', Line, Variable, Name, Fields}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Variable2, State3} = modify(Variable, PreFun, PostFun, State2),
       {Fields2, State4} = modify(Fields, PreFun, PostFun, State3),
       PostFun({'record', Line, Variable2, Name, Fields2}, State4);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'record_field', Line, Name, Value}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Value2, State3} = modify(Value, PreFun, PostFun, State2),
       PostFun({'record_field', Line, Name, Value2}, State3);
     {replace, Val, State2} ->
-      {Val, State2}
+      {Val, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'record_field', Line, Variable, Name, Value}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Variable2, State3} = modify(Variable, PreFun, PostFun, State2),
       {Value2, State4} = modify(Value, PreFun, PostFun, State3),
       PostFun({'record_field', Line, Variable2, Name, Value2}, State4);
     {replace, Val, State2} ->
-      {Val, State2}
+      {Val, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'b_generate', Line, Bin, Source}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Source2, State3} = modify(Source, PreFun, PostFun, State2),
       PostFun({'b_generate', Line, Bin, Source2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'if', Line, Clauses}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Clauses2, State3} = modify(Clauses, PreFun, PostFun, State2),
       PostFun({'if', Line, Clauses2}, State3);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'string', Line, String}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'string', Line, String}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'char', Line, Char}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'char', Line, Char}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'atom', Line, Atom}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       PostFun({'atom', Line, Atom}, State2);
     {replace, Value, State2} ->
-      {Value, State2}
+      {Value, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'map_field_exact', Line, Key, Value}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Key2, State3} = modify(Key, PreFun, PostFun, State2),
       {Value2, State4} = modify(Value, PreFun, PostFun, State3),
       PostFun({'map_field_exact', Line, Key2, Value2}, State4);
     {replace, Value2, State2} ->
-      {Value2, State2}
+      {Value2, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end;
 
 modify(Form = {'map_field_assoc', Line, Key, Value}, PreFun, PostFun, State) ->
   case PreFun(Form, State) of
-    {undefined, State2} ->
+    {continue, State2} ->
       {Key2, State3} = modify(Key, PreFun, PostFun, State2),
       {Value2, State4} = modify(Value, PreFun, PostFun, State3),
       PostFun({'map_field_assoc', Line, Key2, Value2}, State4);
     {replace, Value2, State2} ->
-      {Value2, State2}
+      {Value2, State2};
+    {replace_and_continue, Value, State2} ->
+      {Out, State3} = modify(Value, PreFun, PostFun, State2),
+      PostFun(Out, State3)
   end.

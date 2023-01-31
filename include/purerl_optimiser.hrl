@@ -1,0 +1,38 @@
+-ifndef(PURERL_OPTIMISER_HRL).
+-define(PURERL_OPTIMISER_HRL, 1).
+
+-define(match_function(Name, Arity, Clauses), {function, _, Name, Arity, Clauses}).
+-define(match_local_fun(Name, Arity), {'fun', _, {function, Name, Arity}}).
+-define(match_remote_fun(Module, Name, Arity), {'fun', _, {function, Module, Name, Arity}}).
+-define(match_clause(Args, Guards, Body), {clause, _, Args, Guards, Body}).
+-define(match_block(Body), {block, _, Body}).
+-define(match_case(Value, Clauses), {'case', _, Value, Clauses}).
+-define(match_call(Fun, Args), {call, _, Fun, Args}).
+-define(local_call(Fun), {atom, _, Fun}).
+-define(remote_call(Mod, Fun), {remote, _, {atom, _, Mod}, {atom, _, Fun}}).
+-define(match_match(Lhs, Rhs), {match, _, Lhs, Rhs}).
+-define(match_tuple(Entries), {tuple, _, Entries}).
+-define(match_atom(Atom), {atom, _, Atom}).
+-define(match_integer(Int), {integer, _, Int}).
+-define(match_var(Name), {var, _, Name}).
+-define(match_map(Fields), {map, _, Fields}).
+-define(map_field_exact(Name, Value), {map_field_exact, _, Name, Value}).
+-define(map_field(Name, Value), {map_field_assoc, _, Name, Value}).
+
+-define(make_call(Fun, Args), {call, 0, Fun, Args}).
+-define(make_local_call(Name), ?make_atom(Name)).
+-define(make_remote_call(Mod, Fun), {remote, 0, ?make_atom(Mod), ?make_atom(Fun)}).
+-define(make_lambda(Clauses), {'fun', 0, {clauses, Clauses}}).
+-define(make_atom(Name), {atom, 0, Name}).
+-define(make_var(Name), {var, 0, Name}).
+-define(make_clause(Args, Guards, Body), {clause, 0, Args, Guards, Body}).
+-define(make_block(Body), {block, 0, Body}).
+-define(make_case(Value, Clauses), {'case', 0, Value, Clauses}).
+-define(make_tuple(Items), {tuple, 0, Items}).
+-define(make_nil, {nil, 0}).
+-define(make_cons(H, T), {cons, 0, H, T}).
+-define(make_map(Fields), {map, 0, Fields}).
+-define(make_map_field(Name, Value), {map_field_assoc, 0, Name, Value}).
+-define(make_match(Lhs, Rhs), {match, 0, Lhs, Rhs}).
+
+-endif.
