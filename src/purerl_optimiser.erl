@@ -1014,6 +1014,13 @@ walk(Form = {'match', _Line, Var, Statement}, Fun, State) ->
   State3 = walk(Var, Fun, State2),
   walk(Statement, Fun, State3);
 
+walk(Form = {'try', _Line, Exprs, Of, Catches, After}, Fun, State) ->
+  State2 = Fun(Form, State),
+  State3 = walk(Exprs, Fun, State2),
+  State4 = walk(Of, Fun, State3),
+  State5 = walk(Catches, Fun, State4),
+  walk(After, Fun, State5);
+
 walk(Form = {'call', _Line, Target, Args}, Fun, State) ->
   State2 = Fun(Form, State),
   State3 = walk(Target, Fun, State2),
