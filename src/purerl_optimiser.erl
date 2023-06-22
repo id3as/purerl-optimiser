@@ -40,7 +40,7 @@ parse_transform(Forms = [{attribute, _, file, _}, {attribute, _, module, Module}
 
       %% Debug output...
       case os:getenv("PURS_OPTIMISER_DEBUG") of
-        xfalse ->
+        false ->
           ok;
         _ ->
           filelib:ensure_dir("/tmp/purs_optimiser/foo.txt"),
