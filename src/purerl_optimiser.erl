@@ -1044,6 +1044,9 @@ walk(Form = {'integer', _Line, _Val}, Fun, State) ->
 walk(Form = {'float', _Line, _Val}, Fun, State) ->
   Fun(Form, State);
 
+walk(Form = {'string', _Line, _Val}, Fun, State) ->
+  Fun(Form, State);
+
 walk(Form = {'bin', _Line, _Value}, Fun, State) ->
   Fun(Form, State); %% todo
 
